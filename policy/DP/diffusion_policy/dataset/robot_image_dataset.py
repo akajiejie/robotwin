@@ -28,6 +28,7 @@ class RobotImageDataset(BaseImageDataset):
         val_ratio=0.0,
         batch_size=128,
         max_train_episodes=None,
+        n_obs_steps=None,
     ):
 
         super().__init__()
@@ -52,6 +53,8 @@ class RobotImageDataset(BaseImageDataset):
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
+        # 用于优化显存，只加载必要的观测帧
+        self.n_obs_steps = n_obs_steps if n_obs_steps is not None else horizon
 
         self.batch_size = batch_size
         sequence_length = self.sampler.sequence_length
@@ -132,21 +135,30 @@ class RobotImageDataset(BaseImageDataset):
             raise ValueError(idx)
 
     def postprocess(self, samples, device):
-        agent_pos = samples["state"].to(device, non_blocking=True)
-        head_cam = samples["head_camera"].to(device, non_blocking=True) / 255.0
-        # front_cam = samples['front_camera'].to(device, non_blocking=True) / 255.0
-        # left_cam = samples['left_camera'].to(device, non_blocking=True) / 255.0
-        # right_cam = samples['right_camera'].to(device, non_blocking=True) / 255.0
+        agent_pos = samples["state"][:, :self.n_obs_steps]
+        head_cam = samples["head_camera"][:, :self.n_obs_steps]
+        # front_cam = samples['front_camera'][:, :self.n_obs_steps]
+        # left_cam = samples['left_camera'][:, :self.n_obs_steps]
+        # right_cam = samples['right_camera'][:, :self.n_obs_steps]
+        
+        agent_pos = agent_pos.to(device, non_blocking=True)
+        head_cam = head_cam.to(device, non_blocking=True) / 255.0
+        # front_cam = front_cam.to(device, non_blocking=True) / 255.0
+        # left_cam = left_cam.to(device, non_blocking=True) / 255.0
+        # right_cam = right_cam.to(device, non_blocking=True) / 255.0
+        
+        # action 保持完整的 horizon 长度
         action = samples["action"].to(device, non_blocking=True)
+        
         return {
             "obs": {
-                "head_cam": head_cam,  # B, T, 3, H, W
-                # 'front_cam': front_cam, # B, T, 3, H, W
-                # 'left_cam': left_cam, # B, T, 3, H, W
-                # 'right_cam': right_cam, # B, T, 3, H, W
-                "agent_pos": agent_pos,  # B, T, D
+                "head_cam": head_cam,  # B, n_obs_steps, 3, H, W 
+                # 'front_cam': front_cam, # B, n_obs_steps, 3, H, W
+                # 'left_cam': left_cam, # B, n_obs_steps, 3, H, W
+                # 'right_cam': right_cam, # B, n_obs_steps, 3, H, W
+                "agent_pos": agent_pos,  # B, n_obs_steps, D 
             },
-            "action": action,  # B, T, D
+            "action": action,  # B, horizon, D (保持完整)
         }
 
 

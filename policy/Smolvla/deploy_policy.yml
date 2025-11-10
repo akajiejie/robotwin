@@ -1,0 +1,20 @@
+# deploy_policy.yml for SmolVLA
+
+# [Required] Specify the path to the policy model on Hugging Face Hub.
+# This can be the base pretrained model or a finetuned version.
+policy_path: "checkpoints/010000/pretrained_model"
+
+# [Optional] Device to run the model on. Options: "cuda", "cpu".
+device: "cuda"
+
+# [Optional] Number of action steps predicted by the policy in one go.
+# This should match the model's configuration.
+n_action_steps: 50
+
+# Default task and environment settings, can be overridden by eval.sh
+task_name: "stack_bowls_three"
+task_config: "clean"
+ckpt_setting: "clean"
+seed: null
+policy_name: "Your_Policy"
+instruction_type: seen

@@ -48,3 +48,4 @@ dataset:
   seed: 42
   val_ratio: 0.02
   max_train_episodes: null
+  n_obs_steps: ${dataset_obs_steps}

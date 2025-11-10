@@ -1,0 +1,11 @@
+{
+    "sim-pick_place_cup-100": {
+        "dataset_dir": "./processed_data/sim-pick_place_cup/pick_place_cup-100",
+        "num_episodes": 100,
+        "episode_len": 1345,
+        "camera_names": [
+            "cam_high",
+            "cam_wrist"
+        ]
+    }
+}
