@@ -1,0 +1,401 @@
+defaults:
+  - task: demo_task
+
+name: train_maniflow_pointcloud_policy
+
+task_name: null
+shape_meta: ${task.shape_meta}
+exp_name: "debug"
+
+horizon: 16
+n_obs_steps: 1 # 2
+n_action_steps: 16 # 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+use_img: true
+use_point_map: true
+use_rgb_in_point_map: false
+use_multi_view_img: false
+use_point_cloud: false
+use_pc_color: false
+# action is the first modality, image is the second, point cloud is the third, and language is the fourth
+num_modalities: 3 # 3 for image and point conditions, 2 for only single visual condition, 4 for image, point, and language conditions
+img_cond_mask_ratio: 0.0 # ratio of image condition to be masked
+point_cond_mask_ratio: 0.0 # ratio of point condition to be masked
+lang_cond_mask_ratio: 0.0 # ratio of language condition to be masked
+alternate_injection: false # whether to alternate the injection of image and point cloud conditions
+no_overlap: false # whether to ensure no overlap when masking image and point cloud conditions
+
+mask_img_inference: false # whether to mask image during inference
+mask_point_cloud_inference: false # whether to mask point cloud during inference
+
+use_meta_query: false # whether to use meta-query for conditioning
+meta_query_mode: "concat" # how to use meta-query, can be 'concat' or 'replace'
+num_queries: 64 # number of meta-queries, only used if use_meta_query is
+
+use_dynamic_masking: false # whether to use dynamic masking for image and point cloud conditions
+mask_warmup_epochs: 10 # number of epochs to warm up the mask ratios, default 50
+mask_schedule_type: linear # type of schedule for mask ratios, can be 'linear', 'cosine', or 'exponential'
+
+policy:
+  _target_: maniflow.policy.maniflow_unified_policy_pointmap.ManiFlowUnifiedTransformerPointcloudPolicy
+  use_img: ${use_img}
+  use_point_cloud: ${use_point_cloud}
+  use_point_map: ${use_point_map}
+  block_type: "MMDiT_Generalized" # DiTX, MMDiT, MMDiT_Generalized, HRDT
+  num_modalities: ${num_modalities}
+  n_layer: 12  # max 28
+  n_head: 8  # max 16
+  n_emb: 768 # max 1152
+  img_cond_len: 1024 # adjust according to the task
+  point_cond_len: 512 # adjust according to the task
+  max_lang_cond_len: 1024 # not used for now
+  qkv_bias: true
+  qk_norm: true
+  add_t_to_action_decoder: false # whether to add t to action decoder
+
+  img_cond_mask_ratio: ${img_cond_mask_ratio} # ratio of image condition to be masked
+  point_cond_mask_ratio: ${point_cond_mask_ratio} # ratio of point condition to be masked
+  lang_cond_mask_ratio: ${lang_cond_mask_ratio} # ratio of language condition to be masked
+  alternate_injection: ${alternate_injection} # whether to alternate the injection of
+  use_meta_query: ${use_meta_query} # whether to use meta-query for conditioning
+  meta_query_mode: ${meta_query_mode} # how to use meta-query, can be 'concat' or 'replace'
+  num_queries: ${num_queries} # number of meta-queries, only used if use
+  mask_point_cloud_inference: ${mask_point_cloud_inference} # whether to mask point cloud during inference
+  mask_img_inference: ${mask_img_inference} # whether to mask image during inference
+
+  language_conditioned: false
+  use_train_state: true
+
+  flow_batch_ratio: 0.75 
+  consistency_batch_ratio: 0.25
+
+  sample_t_mode_flow: "beta" 
+  sample_t_mode_consistency: "discrete" 
+  sample_dt_mode_consistency: "uniform"
+  denoise_timesteps: 10
+
+  diffusion_timestep_embed_dim: 128
+  diffusion_stepsize_embed_dim: 128
+
+  use_point_crop: true
+  crop_shape:
+  - 80
+  - 80
+  encoder_type: "DP3Encoder" #"DP3Encoder", "iDP3Encoder", "PointNextEncoder"
+  encoder_output_dim: 128 # 128 for DP3, 512 for pointnet2
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  use_pc_color: ${use_pc_color}
+  pointnet_type: "pointnet" # pointnet, randlanet, pointnet2, uni3d
+  downsample_points: true
+  pointcloud_encoder_cfg:
+    in_channels: 3
+    out_channels: ${policy.encoder_output_dim}
+    use_layernorm: true
+    final_norm: layernorm # layernorm, none
+    normal_channel: false
+    num_points: ${policy.point_cond_len} 
+    pointwise: true
+  
+  ################################## Image Encoder Transformer ##################################
+
+  # image_encoder:
+  #   _target_: maniflow.model.vision_2d.transformer_obs_encoder.TransformerObsEncoder
+  #   shape_meta: ${shape_meta}
+  #   global_pool: ''
+  #   n_emb: ${policy.n_emb}
+
+  #   ##### from scratch #####
+  #   # model_name: 'vit_base_patch16_224'
+  #   # model_name: 'resnet34'
+  #   # model_name: 'vit_tiny_patch16_224'
+  #   # model_name: 'efficientnet_b0'
+  #   # model_name: 'efficientnet_b3'
+  #   # pretrained: False
+  #   # frozen: False
+
+  #   ##### from scratch #####
+  #   # model_name: 'resnet34.a1_in1k'
+  #   model_name: 'vit_base_patch16_clip_224.openai'
+  #   # model_name: 'convnext_base.clip_laion2b_augreg_ft_in12k'
+  #   pretrained: True
+  #   frozen: False
+
+  #   # 'cls' or 'avg' or 'max' or 'soft_attention' or 'spatial_embedding' or 'transformer' or 'attention_pool_2d'
+  #   feature_aggregation: null
+
+  #   # it only works for resnet. 32 (7x7) or 16 (14x14)
+  #   downsample_ratio: 32
+
+  #   transforms:
+  #     - type: RandomCrop
+  #       ratio: 0.95
+  #     - _target_: torchvision.transforms.RandomRotation
+  #       degrees:
+  #         - -5.0
+  #         - 5.0
+  #       expand: false
+  #     - _target_: torchvision.transforms.ColorJitter
+  #       brightness: 0.3
+  #       contrast: 0.4
+  #       saturation: 0.5
+  #       hue: 0.08
+     
+  #   use_group_norm: True
+  #   share_rgb_model: False # False
+
+  ################################## Image Encoder Timm ##################################
+  
+  image_encoder:
+    _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+
+    ##### from scratch #####
+    # model_name: 'vit_base_patch16_224'
+    # model_name: 'resnet34'
+    # model_name: 'vit_tiny_patch16_224'
+    # model_name: 'efficientnet_b0'
+    # model_name: 'efficientnet_b3'
+    # pretrained: False
+    # frozen: False
+
+    ##### from scratch #####
+    # model_name: 'resnet34.a1_in1k'
+    # model_name: 'vit_base_patch16_clip_224.openai'
+    # model_name: 'convnext_base.clip_laion2b_augreg_ft_in12k'
+    # pretrained: True
+    # frozen: False
+    
+    model_name: 'r3m'
+    pretrained: False
+    frozen: False
+
+    global_pool: ''
+
+    feature_aggregation: null
+    position_encording: 'sinusoidal' # 'learnable' or 'sinusoidal'. it only works for transformer
+
+    downsample_ratio: 32
+
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees:
+          - -5.0
+          - 5.0
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+     
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
+
+  ################################## Point Cloud Encoder Transformer ##################################
+
+  # pointcloud_encoder:
+  #   _target_: maniflow.model.vision_2d.transformer_pointmap_encoder.TransformerPointmapEncoder
+  #   shape_meta: ${shape_meta}
+  #   global_pool: ''
+  #   n_emb: ${policy.n_emb}
+
+  #   ##### from scratch #####
+  #   # model_name: 'vit_base_patch16_224'
+  #   # model_name: 'resnet34'
+  #   # model_name: 'vit_tiny_patch16_224'
+  #   # model_name: 'efficientnet_b0'
+  #   # model_name: 'efficientnet_b3'
+  #   # pretrained: False
+  #   # frozen: False
+
+  #   ##### from scratch #####
+  #   # model_name: 'resnet34.a1_in1k'
+  #   model_name: 'vit_base_patch16_clip_224.openai'
+  #   # model_name: 'convnext_base.clip_laion2b_augreg_ft_in12k'
+  #   pretrained: True
+  #   frozen: False
+
+  #   # 'cls' or 'avg' or 'max' or 'soft_attention' or 'spatial_embedding' or 'transformer' or 'attention_pool_2d'
+  #   feature_aggregation: null
+
+  #   # it only works for resnet. 32 (7x7) or 16 (14x14)
+  #   downsample_ratio: 32
+
+  #   use_rgb: ${use_rgb_in_point_map} # whether to use rgb in point map, default False
+
+  #   transforms:
+  #     - type: RandomCrop
+  #       ratio: 0.95
+  #     - _target_: torchvision.transforms.RandomRotation
+  #       degrees:
+  #         - -5.0
+  #         - 5.0
+  #       expand: false
+  #     - _target_: torchvision.transforms.ColorJitter
+  #       brightness: 0.3
+  #       contrast: 0.4
+  #       saturation: 0.5
+  #       hue: 0.08
+     
+  #   use_group_norm: True
+  #   share_rgb_model: False # False
+
+  ############################ Point Cloud Encoder Timm ############################
+
+  pointcloud_encoder:
+    _target_: maniflow.model.vision_2d.timm_pointmap_encoder.TimmPointmapEncoder
+    shape_meta: ${shape_meta}
+
+    ##### from scratch #####
+    # model_name: 'vit_base_patch16_224'
+    # model_name: 'resnet34'
+    # model_name: 'vit_tiny_patch16_224'
+    # model_name: 'efficientnet_b0'
+    # model_name: 'efficientnet_b3'
+    # pretrained: False
+    # frozen: False
+
+    ##### from scratch #####
+    # model_name: 'resnet34.a1_in1k'
+    # model_name: 'vit_base_patch16_clip_224.openai'
+    # model_name: 'convnext_base.clip_laion2b_augreg_ft_in12k'
+    # pretrained: True
+    # frozen: False
+    
+    model_name: 'r3m'
+    pretrained: False
+    frozen: False
+
+    global_pool: ''
+
+    feature_aggregation: null
+    position_encording: 'sinusoidal' # 'learnable' or 'sinusoidal'. it only works for transformer
+
+    downsample_ratio: 32
+
+    use_rgb: ${use_rgb_in_point_map} # whether to use rgb in point map, default False
+
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees:
+          - -5.0
+          - 5.0
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+     
+    use_group_norm: True
+    share_rgb_model: True
+    imagenet_norm: True
+    
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 128 # 384
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True # default False
+  drop_last: True
+
+val_dataloader:
+  batch_size: 32 # 128
+  num_workers: 2
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+  drop_last: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 310 # 2010 for single task, 3000 for multitask
+  gradient_accumulate_every: 1
+  use_ema: True
+  rollout_every: 500 # 200
+  checkpoint_every: 50 # 200
+  val_every: 50
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${exp_name}
+  project: RoboTwin
+  resume: true
+  tags:
+  - RoboTwin
+
+checkpoint:
+  save_ckpt: True # if True, save checkpoint every checkpoint_every
+  topk:
+    monitor_key: train_loss # test_mean_score, val_loss, train_loss
+    # mode: max
+    # k: 0
+    # format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+    mode: min
+    k: 0
+    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.6f}.ckpt'
+    # format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: True # this only saves when save_ckpt is True
+  save_last_snapshot: False
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+checkpoint_num: 3000
+expert_data_num: 100
+raw_task_name: none
+setting: none

@@ -1,0 +1,88 @@
+name: ${task_name}-${setting}-${expert_data_num}
+
+image_shape: &image_shape [3, 224, 224] # [3, 240, 320], [3, 224, 224]
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    head_cam:
+      shape: *image_shape
+      type: rgb
+      horizon: ${n_obs_steps}
+    head_depth:
+      shape: [240, 320]
+      type: depth
+      horizon: ${n_obs_steps}
+    head_intrinsic_cv:
+      shape: [3, 3]
+      type: camera_config
+      horizon: ${n_obs_steps}
+    head_cam2world_gl:
+      shape: [4, 4]
+      type: camera_config
+      horizon: ${n_obs_steps}
+    head_point_cloud:
+      shape: *image_shape
+      type: pointmap # rgb or pointmap
+      horizon: ${n_obs_steps}
+    # front_cam:
+    #   shape: *image_shape
+    #   type: rgb
+    #   horizon: ${n_obs_steps}
+    # left_cam:
+    #   shape: *image_shape
+    #   type: rgb
+    #   horizon: ${n_obs_steps}
+    # right_cam:
+    #   shape: *image_shape
+    #   type: rgb
+    #   horizon: ${n_obs_steps}
+    point_cloud:
+      shape: [1024, 6]
+      type: point_cloud
+      horizon: ${n_obs_steps}
+    agent_pos:
+      shape: [14]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [14]
+    horizon: ${horizon}
+
+env_runner:
+  _target_: maniflow.env_runner.robotwin_runner.RobotRunner
+  max_steps: 300
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  task_name: robot
+
+dataset:
+  # _target_: maniflow.dataset.robotwin_dataset.RoboTwinDataset
+  _target_: maniflow.dataset.robotwin_pointmap_dataset.RoboTwinDataset
+  zarr_path: ../../../data/${task.name}.zarr
+  n_obs_steps: ${n_obs_steps}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 0
+  val_ratio: 0.01
+  max_train_episodes: null
+  batch_size: ${dataloader.batch_size}
+
+  use_img: true # ${use_img}
+  use_multi_view_img: ${use_multi_view_img}
+  use_depth: false
+  use_point_map: ${use_point_map} # whether to use point map
+  use_point_cloud: ${use_point_cloud}
+  img_cond_mask_ratio: ${img_cond_mask_ratio}
+  point_cond_mask_ratio: ${point_cond_mask_ratio}
+
+  use_dynamic_masking: ${use_dynamic_masking} # whether to use dynamic masking for image and point cloud conditions
+  mask_warmup_epochs: ${mask_warmup_epochs} # number of epochs to warm up the mask ratios
+  mask_schedule_type: ${mask_schedule_type} # type of schedule for mask ratios, can be 'linear', 'cosine', or 'exponential'
+  no_overlap: ${no_overlap} # whether to ensure no overlap when masking image and point cloud conditions
+  aug_color_cfg:
+    aug_color: true
+    same_on_batch: false
+    prob: 0.2
+    params: [0.3, 0.4, 0.5, 0.08] # brightness, contrast, saturation, hue
+
