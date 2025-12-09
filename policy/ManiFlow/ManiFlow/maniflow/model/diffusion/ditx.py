@@ -1,268 +1,23 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 # --------------------------------------------------------
 # References:
-# GLIDE: https://github.com/openai/glide-text2im
-# MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
-# FastDIT: https://github.com/chuanyangjin/fast-DiT
+# DiT: https://github.com/facebookresearch/DiT
+# RDT: https://github.com/thu-ml/RoboticsDiffusionTransformer
 # --------------------------------------------------------
 
 import re
-import math
 import logging
-from typing import Union, Tuple, List
+from typing import Union, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.jit import Final
-from timm.models.vision_transformer import Mlp, RmsNorm, use_fused_attn
+from timm.models.vision_transformer import Mlp, RmsNorm
 from maniflow.model.diffusion.positional_embedding import SinusoidalPosEmb
-from maniflow.model.diffusion.hrdt_block import HRDTBlock, ActionDecoder
+from maniflow.model.diffusion.ditx_block import DiTXBlock, AdaptiveLayerNorm
 from termcolor import cprint
 
 logger = logging.getLogger(__name__)
-
-# def modulate(x, shift, scale):
-#     return shift + (x * (scale))
-
-def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-class CrossAttention(nn.Module):
-    """
-    A cross-attention layer with flash attention.
-    """
-    fused_attn: Final[bool]
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int = 8,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            attn_drop: float = 0,
-            proj_drop: float = 0,
-            norm_layer: nn.Module = nn.LayerNorm,
-    ) -> None:
-        super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.fused_attn = use_fused_attn()
-
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-    
-    def forward(self, x: torch.Tensor, c: torch.Tensor, 
-                mask: None) -> torch.Tensor:
-        B, N, C = x.shape
-        _, L, _ = c.shape
-        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        kv = self.kv(c).reshape(B, L, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
-
-        # Prepare attn mask (B, L) to mask the conditioion
-        if mask is not None:
-            mask = mask.reshape(B, 1, 1, L)
-            mask = mask.expand(-1, -1, N, -1)
-        
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                query=q,
-                key=k,
-                value=v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-                attn_mask=mask
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            if mask is not None:
-                attn = attn.masked_fill_(mask.logical_not(), float('-inf'))
-            attn = attn.softmax(dim=-1)
-            if self.attn_drop.p > 0:
-                attn = self.attn_drop(attn)
-            x = attn @ v
-            
-        x = x.permute(0, 2, 1, 3).reshape(B, N, C)
-        x = self.proj(x)
-        if self.proj_drop.p > 0:
-            x = self.proj_drop(x)
-        return x
-
-
-# class DiTXBlock(nn.Module):
-#     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, p_drop_attn=0., 
-#                     qkv_bias=True, qk_norm=True,
-#                  **block_kwargs):
-#         super().__init__()
-#         self.hidden_size = hidden_size
-        
-#         # Layers
-#         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-#         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-#         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)  # Added missing norm3
-        
-#         self.self_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True, 
-#                                               dropout=p_drop_attn, **block_kwargs)
-#         self.cross_attn = CrossAttention(dim=hidden_size, num_heads=num_heads,
-#                                         qkv_bias=qkv_bias, qk_norm=qk_norm,
-#                                         norm_layer=nn.LayerNorm, **block_kwargs)
-        
-#         # MLP with GELU activation
-#         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-#         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, 
-#                        act_layer=lambda: nn.GELU(approximate="tanh"), drop=0.0)
-
-#         # AdaLN modulation
-#         self.adaLN_modulation = nn.Sequential(
-#             nn.SiLU(),
-#             nn.Linear(hidden_size, 9 * hidden_size, bias=True)
-#         )
-
-#     def forward(self, x, global_c, context_c, attn_mask=None):
-#         # Ensure c is broadcastable to x's shape
-#         if len(global_c.shape) == 2:
-#             global_c = global_c.unsqueeze(1)
-
-#         # Get all modulation parameters at once (9 groups total)
-#         mod = self.adaLN_modulation(global_c)
-#         chunk_size = self.hidden_size
-        
-#         # Extract parameters for each block (shift, scale, gate for each of the 3 components)
-#         params = {}
-#         for i, name in enumerate(['self', 'cross', 'mlp']):
-#             start_idx = i * 3 * chunk_size
-#             params[f'shift_{name}'] = mod[:, :, start_idx:start_idx + chunk_size]
-#             params[f'scale_{name}'] = mod[:, :, start_idx + chunk_size:start_idx + 2*chunk_size]
-#             params[f'gate_{name}'] = mod[:, :, start_idx + 2*chunk_size:start_idx + 3*chunk_size]
-        
-#         # Self-attention block
-#         normed_x = modulate(self.norm1(x), params['shift_self'], params['scale_self'])
-#         self_out, _ = self.self_attn(normed_x, normed_x, normed_x, attn_mask=attn_mask)
-#         x = x + params['gate_self'] * self_out
-        
-#         # Cross-attention block
-#         normed_x = modulate(self.norm2(x), params['shift_cross'], params['scale_cross'])
-#         cross_out = self.cross_attn(normed_x, context_c, mask=None)
-#         x = x + params['gate_cross'] * self.cross_attn.attn_drop(cross_out)
-        
-#         # MLP block
-#         normed_x = modulate(self.norm3(x), params['shift_mlp'], params['scale_mlp'])
-#         mlp_out = self.mlp(normed_x)
-#         x = x + params['gate_mlp'] * mlp_out
-        
-#         return x
-
-class DiTXBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, p_drop_attn=0., 
-                 qkv_bias=True, qk_norm=True, 
-                 apply_adaLN_self_attn=True, apply_adaLN_cross_attn=True, apply_adaLN_mlp=True,
-                 **block_kwargs):
-        super().__init__()
-        self.apply_adaLN_self_attn = apply_adaLN_self_attn
-        self.apply_adaLN_mlp = apply_adaLN_mlp
-        self.apply_adaLN_cross_attn = apply_adaLN_cross_attn
-        self.hidden_size = hidden_size
-
-        # cprint(f"DiTXBlock - apply_adaLN_self_attn: {self.apply_adaLN_self_attn}, apply_adaLN_cross_attn: {self.apply_adaLN_cross_attn}, apply_adaLN_mlp: {self.apply_adaLN_mlp}", "red")
-
-        # Normalization layers
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)  # For self-attention
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)  # For cross-attention
-        self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)  # For MLP
-
-
-        # Self-Attention
-        
-        self.self_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True, 
-                                            dropout=p_drop_attn,
-                                            # **block_kwargs
-                                            )
-        
-        # Cross-Attention
-        qkv_bias = qkv_bias # default to True for DiTMIXBlock
-        qk_norm = qk_norm  # default to True for DiTMIXBlock
-        # cprint(f"Using qkv_bias: {qkv_bias}, qk_norm: {qk_norm}", "yellow")
-    
-        self.cross_attn = CrossAttention(
-            dim=hidden_size, num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            norm_layer=nn.LayerNorm, **block_kwargs
-        )
-       
-        # MLP
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")  # Standard GELU
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0.0)
-
-        modulation_size = 9 * hidden_size
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, modulation_size, bias=True)
-        )
-        
-    def forward(self, x, global_c, context_c, attn_mask=None):
-        # adaLN modulation for self-attention, cross-attention, and optionally MLP
-        modulation = self.adaLN_modulation(global_c)  # Shape varies based on conditioning flags
-        current_chunk = 0
-
-        # Self-Attention parameters
-        shift_msa, scale_msa, gate_msa = modulation[:, current_chunk:current_chunk + self.hidden_size], \
-                                         modulation[:, current_chunk + self.hidden_size:current_chunk + 2 * self.hidden_size], \
-                                         modulation[:, current_chunk + 2 * self.hidden_size:current_chunk + 3 * self.hidden_size]
-        current_chunk += 3 * self.hidden_size
-
-        # Cross-Attention parameters
-        if self.apply_adaLN_cross_attn:
-            shift_cross, scale_cross, gate_cross = modulation[:, current_chunk:current_chunk + self.hidden_size], \
-                                                   modulation[:, current_chunk + self.hidden_size:current_chunk + 2 * self.hidden_size], \
-                                                   modulation[:, current_chunk + 2 * self.hidden_size:current_chunk + 3 * self.hidden_size]
-            current_chunk += 3 * self.hidden_size
-        else:
-            shift_cross, scale_cross, gate_cross = None, None, None
-
-        # Scale and shift for MLP
-        shift_mlp, scale_mlp, gate_mlp = modulation[:, current_chunk:current_chunk + self.hidden_size], \
-                                            modulation[:, current_chunk + self.hidden_size:current_chunk + 2 * self.hidden_size], \
-                                            modulation[:, current_chunk + 2 * self.hidden_size:current_chunk + 3 * self.hidden_size]
-        current_chunk += 3 * self.hidden_size
-
-        # Self-Attention with adaLN conditioning
-        normed_x = modulate(self.norm1(x), shift_msa, scale_msa)  # Shape: (batch_size, seq_length, hidden_size)
-        self_attn_output, _ = self.self_attn(normed_x, normed_x, normed_x, attn_mask=attn_mask)  # Shape: (batch_size, seq_length, hidden_size)
-        x = x + gate_msa.unsqueeze(1) * self_attn_output  # Apply gating and residual connection
-        
-        # Cross-Attention with adaLN conditioning (if applied)
-        if self.apply_adaLN_cross_attn:
-            normed_x_cross = modulate(self.norm2(x), shift_cross, scale_cross)  # Apply adaLN to x before cross-attn
-        else:
-            normed_x_cross = self.norm2(x)  # Normalize without adaLN
-
-
-        cross_attn_output = self.cross_attn(normed_x_cross, context_c, mask=None)  # Shape: (batch_size, seq_length, hidden_size)
-        if self.apply_adaLN_cross_attn:
-            x = x + gate_cross.unsqueeze(1) * self.cross_attn.attn_drop(cross_attn_output)  # Gated residual connection
-        else:
-            x = x + self.cross_attn.attn_drop(cross_attn_output)  # Apply residual connection without gating
-    
-
-        # MLP with adaLN conditioning
-        normed_x_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)  # Apply adaLN modulation
-        mlp_output = self.mlp(normed_x_mlp)  # Pass through MLP
-        x = x + gate_mlp.unsqueeze(1) * mlp_output  # Apply gating and residual connection
-
-        return x
-
 
 class FinalLayer(nn.Module):
     """
@@ -284,7 +39,7 @@ class FinalLayer(nn.Module):
     
 class DiTX(nn.Module):
     """
-    Flow Matching model with a Transformer backbone.
+    Consistency Flow Training model with a Diffusion Transformer backbone.
     """
     def __init__(
         self,
@@ -295,7 +50,7 @@ class DiTX(nn.Module):
         cond_dim: int = 256,
         visual_cond_len: int = 1024,
         diffusion_timestep_embed_dim: int = 256,
-        diffusion_stepsize_embed_dim: int = 256,
+        diffusion_target_t_embed_dim: int = 256,
         block_type: str = "DiTX",
         n_layer: int = 12,
         n_head: int = 12,
@@ -304,15 +59,15 @@ class DiTX(nn.Module):
         p_drop_attn: float = 0.1,
         qkv_bias: bool = False,
         qk_norm: bool = False,
-        add_t_to_action_decoder: bool = False,
+        pre_norm_modality: bool = False,
         language_conditioned: bool=False,
-        initialize_weights: bool = True,
+        language_model: str = "t5-small",
     ):
         super().__init__()
-        # compute number of tokens for main trunk and condition encoder
         self.n_obs_steps = n_obs_steps
         self.visual_cond_len = visual_cond_len
         self.language_conditioned = language_conditioned
+        self.pre_norm_modality = pre_norm_modality
         
         # constants
         T = horizon
@@ -327,33 +82,49 @@ class DiTX(nn.Module):
         self.vis_cond_pos_embed = nn.Parameter(
             torch.zeros(1, visual_cond_len * n_obs_steps, n_emb)
             )  # learnable visual condition positional embedding
+        
+        # pre-norm visual modality
+        if self.pre_norm_modality:
+            # If pre-norm modality is used, apply adaLN modulation before the transformer blocks
+            self.vis_norm = AdaptiveLayerNorm(
+                dim=n_emb,
+                dim_cond=n_emb,
+            )
 
-        # timestep and stepsize cond encoder
+        # timestep and target_t cond encoder
         flow_timestep_encoder = nn.Sequential(
             SinusoidalPosEmb(diffusion_timestep_embed_dim),
             nn.Linear(diffusion_timestep_embed_dim, diffusion_timestep_embed_dim * 4),
             nn.Mish(),
             nn.Linear(diffusion_timestep_embed_dim * 4, n_emb),
         )
-        flow_stepsize_encoder = nn.Sequential(
-            SinusoidalPosEmb(diffusion_stepsize_embed_dim),
-            nn.Linear(diffusion_stepsize_embed_dim, diffusion_stepsize_embed_dim * 4),
+        flow_target_t_encoder = nn.Sequential(
+            SinusoidalPosEmb(diffusion_target_t_embed_dim),
+            nn.Linear(diffusion_target_t_embed_dim, diffusion_target_t_embed_dim * 4),
             nn.Mish(),
-            nn.Linear(diffusion_stepsize_embed_dim * 4, self.hidden_dim),
+            nn.Linear(diffusion_target_t_embed_dim * 4, self.hidden_dim),
         )
         self.flow_timestep_encoder = flow_timestep_encoder
-        self.flow_stepsize_encoder = flow_stepsize_encoder
-        self.timestep_stepsize_adaptor = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
+        self.flow_target_t_encoder = flow_target_t_encoder
+        self.timestep_target_t_adaptor = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
 
         # Language conditioning, use T5-small as default
         if self.language_conditioned:
-            self.load_T5_encoder(freeze=True)
+            self.load_T5_encoder(
+                model_name=language_model,
+                freeze=True)
             self.lang_adaptor = self.build_condition_adapter(
                 "mlp2x_gelu", 
                 in_features=self.language_encoder_out_dim, 
                 out_features=n_emb
             )
-        
+            # pre-norm language modality
+            if self.pre_norm_modality:
+                self.lang_norm = AdaptiveLayerNorm(
+                    dim=n_emb,
+                    dim_cond=n_emb,
+                )
+            
         # Building the transformer blocks
         self.block_type = block_type
         if block_type == "DiTX":
@@ -363,45 +134,13 @@ class DiTX(nn.Module):
             ])
             cprint(f"[DiTX Transformer] Initialized {n_layer} DiTX blocks with hidden size {n_emb}, "
                     f"num heads {n_head}, mlp ratio {mlp_ratio}, dropout {p_drop_attn}, qkv_bias {qkv_bias}, qk_norm {qk_norm}", "cyan")
-        elif block_type == "HRDT":
-            HRDT_config = {
-                "hidden_size": n_emb,
-                "num_heads": n_head,
-                "num_kv_heads": 8,
-                "norm_eps": 0.00001,
-                "multiple_of": 256,
-                "ffn_dim_multiplier": None,
-                "use_flash_attn": True,  # use flash attention
-            }
-            self.blocks = nn.ModuleList([
-                HRDTBlock(layer_idx, config=HRDT_config, 
-                        #   training_mode=training_mode
-                          ) for layer_idx in range(n_layer)
-            ])
-            cprint(f"[HRDT Transformer] Initialized {n_layer} HRDT blocks with hidden size {n_emb}, "   
-                    f"num heads {n_head}, norm_eps {HRDT_config['norm_eps']}, "
-                    f"multiple_of {HRDT_config['multiple_of']}, use_flash_attn {HRDT_config['use_flash_attn']}", "cyan")
         
-        self.add_t_to_action_decoder = add_t_to_action_decoder
-        if add_t_to_action_decoder:
-            # Final Layer
-            action_decoder_config = {
-                "hidden_size": n_emb,
-                "norm_eps": 0.00001,
-                "output_size": output_dim,
-            }
-            self.final_layer = ActionDecoder(
-                action_decoder_config,
-            )
-            cprint(f"[DiTX Transformer] Initialized ActionDecoder with hidden size {n_emb}, output dim {output_dim}", "cyan")
-        else: 
-            self.final_layer = FinalLayer(n_emb, output_dim)
-            cprint(f"[DiTX Transformer] Initialized FinalLayer with hidden size {n_emb}, output dim {output_dim}", "cyan")
-        
-        
-        if initialize_weights:
-            self.initialize_weights()
-            cprint(f"[DiTX Transformer] Initialized weights for DiTX", "green")
+        # Final Layer
+        self.final_layer = FinalLayer(n_emb, output_dim)
+
+        self.initialize_weights()
+        cprint(f"[DiTX Transformer] Initialized weights for DiTX", "green")
+
         
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
@@ -428,14 +167,15 @@ class DiTX(nn.Module):
         return projector
     
     # language encoder
-    def load_T5_encoder(self, freeze=True):
+    def load_T5_encoder(self, model_name, freeze=True):
         from transformers import (
             T5Config,
             T5EncoderModel,
             AutoTokenizer
         )
         T5_model_name = ["t5-small", "t5-base", "t5-large", "t5-3b", "t5-11b"]
-        encoder_name = T5_model_name[0]
+        assert model_name in T5_model_name, f"Model name {model_name} not in {T5_model_name}"
+        encoder_name = model_name
         pretrained_model_id = f"google-t5/{encoder_name}"
         encoder_cfg = T5Config()
         self.language_encoder = T5EncoderModel(encoder_cfg).from_pretrained(
@@ -450,12 +190,12 @@ class DiTX(nn.Module):
 
         self.language_encoder_out_dim = 512
         cprint(f"Loaded T5 encoder: {encoder_name}", "green")
-    
-    def encode_text_input_T5(self, 
-                             lang_cond, 
-                             norm_lang_embedding=False, 
-                             device="cuda",
-                             output_type="sentence"
+
+    def encode_text_input_T5(self,
+                             lang_cond,
+                             norm_lang_embedding=False,
+                             output_type="sentence",
+                             device="cuda" if torch.cuda.is_available() else "cpu"
                              ):
         language_inputs = self.tokenizer(
             lang_cond,
@@ -481,15 +221,14 @@ class DiTX(nn.Module):
 
     def initialize_weights(self):
         for block in self.blocks:
-            if self.block_type == "DiTX":
-                # Initialize self_attn's in_proj_weight and out_proj
-                nn.init.xavier_uniform_(block.self_attn.in_proj_weight)
-                if block.self_attn.in_proj_bias is not None:
-                    nn.init.zeros_(block.self_attn.in_proj_bias)
-                
-                nn.init.xavier_uniform_(block.self_attn.out_proj.weight)
-                if block.self_attn.out_proj.bias is not None:
-                    nn.init.zeros_(block.self_attn.out_proj.bias)
+            # Initialize self_attn's in_proj_weight and out_proj
+            nn.init.xavier_uniform_(block.self_attn.in_proj_weight)
+            if block.self_attn.in_proj_bias is not None:
+                nn.init.zeros_(block.self_attn.in_proj_bias)
+            
+            nn.init.xavier_uniform_(block.self_attn.out_proj.weight)
+            if block.self_attn.out_proj.bias is not None:
+                nn.init.zeros_(block.self_attn.out_proj.bias)
 
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -519,8 +258,8 @@ class DiTX(nn.Module):
                 if layer.bias is not None:
                     nn.init.constant_(layer.bias, 0)
         
-        # Initialize diffusion stepsize encoder:
-        for layer in self.flow_stepsize_encoder:
+        # Initialize diffusion target_t encoder:
+        for layer in self.flow_target_t_encoder:
             if isinstance(layer, nn.Linear):
                 nn.init.normal_(layer.weight, std=0.02)
                 if layer.bias is not None:
@@ -530,94 +269,39 @@ class DiTX(nn.Module):
         nn.init.normal_(self.vis_cond_obs_emb.weight, std=0.02)
         nn.init.constant_(self.vis_cond_obs_emb.bias, 0) if self.vis_cond_obs_emb.bias is not None else None
 
-        # Initialize the adapter for timestep and stepsize
-        nn.init.normal_(self.timestep_stepsize_adaptor.weight, std=0.02)
-        nn.init.constant_(self.timestep_stepsize_adaptor.bias, 0)
+        # Initialize the adapter for timestep and target_t
+        nn.init.normal_(self.timestep_target_t_adaptor.weight, std=0.02)
+        nn.init.constant_(self.timestep_target_t_adaptor.bias, 0)
+
+        if self.language_conditioned:
+            # Initialize the language condition adapter
+            nn.init.normal_(self.lang_adaptor[0].weight, std=0.02)
+            nn.init.constant_(self.lang_adaptor[0].bias, 0) if self.lang_adaptor[0].bias is not None else None
+            nn.init.normal_(self.lang_adaptor[-1].weight, std=0.02)
+            nn.init.constant_(self.lang_adaptor[-1].bias, 0) if self.lang_adaptor[-1].bias is not None else None
+        
+        if self.pre_norm_modality:
+            # Initialize the adaptive layer norm for visual condition
+            nn.init.zeros_(self.vis_norm.cond_linear.weight)
+            nn.init.constant_(self.vis_norm.cond_linear.bias[:self.hidden_dim], 1.)
+            nn.init.zeros_(self.vis_norm.cond_linear.bias[self.hidden_dim:])
+            if self.language_conditioned:
+                # Initialize the adaptive layer norm for language condition
+                nn.init.zeros_(self.lang_norm.cond_linear.weight)
+                nn.init.constant_(self.lang_norm.cond_linear.bias[:self.hidden_dim], 1.)
+                nn.init.zeros_(self.lang_norm.cond_linear.bias[self.hidden_dim:])
 
         # Initialize the final layer: zero-out the final linear layer
-        if not self.add_t_to_action_decoder:
-            nn.init.constant_(self.final_layer.ffn_final.fc2.weight, 0)
-            nn.init.constant_(self.final_layer.ffn_final.fc2.bias, 0)
-        else:
-            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(self.final_layer.ffn.fc2.weight, 0)
-            nn.init.constant_(self.final_layer.ffn.fc2.bias, 0)
-    # def initialize_weights(self):
-    #     def _basic_init(module):
-    #         if isinstance(module, nn.Linear):
-    #             torch.nn.init.xavier_uniform_(module.weight)
-    #             if module.bias is not None:
-    #                 nn.init.constant_(module.bias, 0)
-        
-    #     for block in self.blocks:
-    #         block.apply(_basic_init)
-            
-    #         # Initialize self_attn's in_proj_weight and out_proj
-    #         nn.init.xavier_uniform_(block.self_attn.in_proj_weight)
-    #         if block.self_attn.in_proj_bias is not None:
-    #             nn.init.zeros_(block.self_attn.in_proj_bias)
-            
-    #         nn.init.xavier_uniform_(block.self_attn.out_proj.weight)
-    #         if block.self_attn.out_proj.bias is not None:
-    #             nn.init.zeros_(block.self_attn.out_proj.bias)
+        nn.init.constant_(self.final_layer.ffn_final.fc2.weight, 0)
+        nn.init.constant_(self.final_layer.ffn_final.fc2.bias, 0)
 
-    #         # Zero-out adaLN modulation layers in DiT blocks:
-    #         nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-    #         nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        
-    #     # Initialize input emb by normal distribution:
-    #     nn.init.normal_(self.input_emb.weight, std=0.02)
-    #     nn.init.constant_(self.input_emb.bias, 0) if self.input_emb.bias is not None else None
-
-    #     # Initialize pos emb by normal distribution:
-    #     nn.init.normal_(self.pos_emb, std=0.02)       
-    #     # nn.init.constant_(self.pos_emb, 0) # not used 
-
-    #     # Initialize diffusion step encoder:
-    #     for layer in self.flow_timestep_encoder:
-    #         if isinstance(layer, nn.Linear):
-    #             nn.init.normal_(layer.weight, std=0.02)
-    #             if layer.bias is not None:
-    #                 nn.init.constant_(layer.bias, 0)
-        
-    #     # Initialize diffusion stepsize encoder:
-    #     for layer in self.flow_stepsize_encoder:
-    #         if isinstance(layer, nn.Linear):
-    #             nn.init.normal_(layer.weight, std=0.02)
-    #             if layer.bias is not None:
-    #                 nn.init.constant_(layer.bias, 0)
-        
-    #     # Initialize conditional observation embedding:
-    #     nn.init.normal_(self.vis_cond_obs_emb.weight, std=0.02)
-    #     nn.init.constant_(self.vis_cond_obs_emb.bias, 0) if self.vis_cond_obs_emb.bias is not None else None
-
-    #     # Initialize the adapter for timestep and stepsize
-    #     nn.init.normal_(self.timestep_stepsize_adaptor.weight, std=0.02)
-    #     nn.init.constant_(self.timestep_stepsize_adaptor.bias, 0)
-
-    #     # Initialize the final layer: zero-out the final linear layer
-    #     nn.init.constant_(self.final_layer.ffn_final.fc2.weight, 0)
-    #     nn.init.constant_(self.final_layer.ffn_final.fc2.bias, 0)
-        
-        
-    
-    def get_optim_groups(self, weight_decay: float=1e-3, group_params=False):
+    def get_optim_groups(self, weight_decay: float=1e-3):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
         We are separating out all parameters of the model into two buckets: those that will experience
         weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
         We are then returning the PyTorch optimizer object.
         """
-
-        if not group_params:
-            cprint("Using single parameter group for optimizer, with weight decay applied to all parameters", "yellow")
-            return [
-                {
-                    "params": list(self.parameters()),
-                    "weight_decay": weight_decay,  # All parameters get the same weight decay
-                }
-            ]
 
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
@@ -687,26 +371,28 @@ class DiTX(nn.Module):
     def forward(self, 
             sample: torch.Tensor, 
             timestep: Union[torch.Tensor, float, int], 
-            stepsize: Union[torch.Tensor, float, int], 
-            global_cond: torch.Tensor,
+            target_t: Union[torch.Tensor, float, int], 
+            vis_cond: torch.Tensor,
             lang_cond: Union[torch.Tensor, list, str] = None,
             **kwargs):
         """
-        x: (B,T,input_dim)
-        timestep: (B,) or int, maniflow time step t
-        stepsize: (B,) or float, the step size for the flow matching process
-        global_cond: (B,T, vis_cond_dim) 
-        lang_cond: (B,) or list of strings, language condition input
-        **kwargs: additional arguments
-        output: (B,T,output_dim)
+        Forward pass of the DiTX model.
+        Input:
+            x: (B,T,input_dim)
+            timestep: (B,) or int, maniflow time step t
+            target_t: (B,) or float, the target absolute or relative time for the consistency flow training process
+            vis_cond: (B,T, vis_cond_dim) 
+            lang_cond: (B,) or list of strings, language condition input
+            **kwargs: additional arguments
+        output: 
+            action: (B,T,output_dim)
         """
 
-        """ To be implemented: residual condition, dropout, etc. """
-        
         # process input
         input_emb = self.input_emb(sample) # (B, T, n_emb)
         x = input_emb + self.pos_emb # (B, T, n_emb)
  
+
         # 1. time
         timesteps = timestep
         if not torch.is_tensor(timesteps):
@@ -717,47 +403,46 @@ class DiTX(nn.Module):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps.expand(sample.shape[0])
         timestep_embed = self.flow_timestep_encoder(timesteps) # (B, n_emb)
-        # global_c = timestep_embed
-
-        # 2. stepsize
-        stepsizes = stepsize
-        if not torch.is_tensor(stepsizes): 
-            stepsizes = torch.tensor([stepsizes], dtype=torch.float32, device=sample.device)    
-        elif torch.is_tensor(stepsizes) and len(stepsizes.shape) == 0:
-            stepsizes = stepsizes[None].to(sample.device)
-        stepsizes = stepsizes.expand(sample.shape[0])
-        stepsize_embed = self.flow_stepsize_encoder(stepsizes) # (B, n_emb)
-        global_c = torch.cat([timestep_embed, stepsize_embed], dim=-1) # (B, 2*n_emb)
-        global_c = self.timestep_stepsize_adaptor(global_c) # (B, n_emb)
         
+
+        # 2. target_t
+        target_ts = target_t
+        if not torch.is_tensor(target_ts): 
+            target_ts = torch.tensor([target_ts], dtype=torch.float32, device=sample.device)    
+        elif torch.is_tensor(target_ts) and len(target_ts.shape) == 0:
+            target_ts = target_ts[None].to(sample.device)
+        target_ts = target_ts.expand(sample.shape[0])
+        target_t_embed = self.flow_target_t_encoder(target_ts) # (B, n_emb)
+        
+        time_c = torch.cat([timestep_embed, target_t_embed], dim=-1) # (B, 2*n_emb)
+        time_c = self.timestep_target_t_adaptor(time_c) # (B, n_emb)
+        
+
         # 3. visual condition
-        vis_con_obs_emb = self.vis_cond_obs_emb(global_cond) # (B, L, n_emb)
-        vis_cond_pos_embed = self.vis_cond_pos_embed[:, :global_cond.shape[1]]
+        vis_con_obs_emb = self.vis_cond_obs_emb(vis_cond) # (B, L, n_emb)
+        vis_cond_pos_embed = self.vis_cond_pos_embed[:, :vis_cond.shape[1]]
         context_c = vis_con_obs_emb + vis_cond_pos_embed # (B, L, n_emb)
+        if self.pre_norm_modality:
+            context_c = self.vis_norm(context_c, time_c)
+
 
         # 4. language condition
         if self.language_conditioned:
             assert lang_cond is not None
-            lang_c = self.encode_text_input_T5(lang_cond, output_type="token")
+            lang_c = self.encode_text_input_T5(lang_cond, output_type="token", device=sample.device) # (B, L_lang, 512)
             lang_c = self.lang_adaptor(lang_c) # (B, L, D) or (B, D)
+            if self.pre_norm_modality:
+                lang_c = self.lang_norm(lang_c, time_c)
             context_c = torch.cat([context_c, lang_c], dim=1) # (B, L + L_lang, n_emb)
-        
-        if self.block_type == "HRDT":
-            # HRDT expects context_c as a dictionary
-            context_c = {
-                'img_c': context_c,
-                'lang_c': lang_c if self.language_conditioned else None,
-            }
+
 
         # 5. transformer blocks
         for block in self.blocks:
-            x = block(x, global_c, context_c) # (B, T, n_emb)
+            x = block(x, time_c, context_c) # (B, T, n_emb)
+
 
         # 6. head
-        if not self.add_t_to_action_decoder:
-            x = self.final_layer(x)
-        else:
-            x = self.final_layer(x, global_c)
+        x = self.final_layer(x)
        
         # (B, T, output_dim)
         x = x[:, -self.horizon:] # (B, T, out_channels)
@@ -770,28 +455,29 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sample = torch.randn(2, 10, 16).to(device)  # Batch size 2, horizon 10, input_dim 16
     timestep = torch.tensor([1, 2]).to(device)  # Example timesteps for each sample in the batch
-    stepsize = torch.tensor([0.1, 0.2]).to(device)  # Example stepsizes for each sample in the batch
-    vis_cond = torch.randn(2, 5, 256).to(device)  # 5 time steps of visual condition
+    target_t = torch.tensor([0.1, 0.2]).to(device)  # Example target_ts for each sample in the batch
+    vis_cond = torch.randn(2, 256, 256).to(device)  # 5 time steps of visual condition
     lang_cond = ["This is a test sentence.", "Another test sentence."]
     model = DiTX(
         input_dim=16,
         output_dim=16,
         horizon=10,
-        n_obs_steps=5,
+        n_obs_steps=2,
         cond_dim=256,
-        visual_cond_len=5,
+        visual_cond_len=128,
         diffusion_timestep_embed_dim=256,
-        diffusion_stepsize_embed_dim=256,
-        block_type="HRDT", # "DiTX" or "HRDT"
+        diffusion_target_t_embed_dim=256,
+        block_type="DiTX",
         n_layer=2,  # Reduced for testing
         n_head=8,
         n_emb=768,
         mlp_ratio=4.0,
         p_drop_attn=0.1,
-        language_conditioned=False,  # Set to True if you want to test language conditioning
+        language_conditioned=True,
+        pre_norm_modality=True,
     )
     model = model.to(device)
-    output = model(sample, timestep, stepsize, vis_cond, lang_cond)
+    output = model(sample, timestep, target_t, vis_cond, lang_cond)
     print("Output shape:", output.shape)  # Should be (2, 10, 768)
     assert output.shape == (2, 10, 16), "Output shape mismatch!"
     # Check if the model is initialized correctly

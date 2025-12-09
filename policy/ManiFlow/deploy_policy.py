@@ -28,7 +28,6 @@ parent_directory = os.path.dirname(current_file_path)
 sys.path.append(os.path.join(parent_directory, 'ManiFlow'))
 
 from maniflow_policy import *
-from maniflow.common.model_util import adjust_intrinsics, resize_depth, depth_to_pointcloud
 
 
 def encode_obs(observation):  # Post-Process Observation
@@ -36,34 +35,11 @@ def encode_obs(observation):  # Post-Process Observation
     head_cam = (np.moveaxis(observation["observation"]["head_camera"]["rgb"], -1, 0) / 255)
     left_cam = (np.moveaxis(observation["observation"]["left_camera"]["rgb"], -1, 0) / 255)
     right_cam = (np.moveaxis(observation["observation"]["right_camera"]["rgb"], -1, 0) / 255)
-    head_depth = observation["observation"]["head_camera"]["depth"] / 1000.0 # convert mm to meters
-    head_intrinsic_cv = observation["observation"]["head_camera"]["intrinsic_cv"]
-    head_cam2world_gl = observation["observation"]["head_camera"]["cam2world_gl"]
-    # hack here for now, to be fixed later
-    head_depth = head_depth.astype(np.float32)
-    original_size = (240, 320)  # (height, width) of your current depth/images
-    target_size = (224, 224)   # (height, width) target size
-    head_depth = resize_depth(head_depth, target_size=target_size)  # Resize to 224x224
-    head_intrinsic_cv = adjust_intrinsics(head_intrinsic_cv, original_size, target_size)
-    # convert depth map to point cloud
-    h, w = head_depth.shape
-    head_point_cloud = depth_to_pointcloud(head_depth, head_intrinsic_cv, head_cam2world_gl) # (B, H*W, 3)
-    # reshape to (B, H, W, 3)
-    head_point_cloud = head_point_cloud.reshape(1, h, w, 3).astype(np.float32)
-    # then to (B, 3, H, W)
-    head_point_cloud = np.moveaxis(head_point_cloud, -1, 1) # (B, 3, H, W)
-    head_point_cloud = head_point_cloud.squeeze(0) # (3, H, W)
-            
-
+    obs['head_cam'] = head_cam
+    obs['left_wrist_cam'] = left_cam
+    obs['right_wrist_cam'] = right_cam
     obs['agent_pos'] = observation['joint_action']['vector']
     obs['point_cloud'] = observation['pointcloud']
-    obs['head_cam'] = head_cam
-    obs['left_cam'] = left_cam
-    obs['right_cam'] = right_cam
-    obs['head_point_cloud'] = head_point_cloud
-    obs['head_depth'] = head_depth.astype(np.float32)
-    obs['head_intrinsic_cv'] = head_intrinsic_cv.astype(np.float32)
-    obs['head_cam2world_gl'] = head_cam2world_gl.astype(np.float32)
     return obs
 
 
@@ -126,10 +102,6 @@ def eval(TASK_ENV, model, observation):
         obs = encode_obs(observation)
         model.update_obs(obs)  # Update Observation, `update_obs` here can be modified
 
-
-# def reset_model(
-#         model):  # Clean the model cache at the beginning of every evaluation episode, such as the observation window
-#     model.env_runner.reset_obs()
 
 def reset_model(model):
     # Reset temporal aggregation state if enabled

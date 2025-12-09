@@ -1,0 +1,71 @@
+name: ${task_name}-${setting}-${expert_data_num}
+
+image_shape: &image_shape [3, 224, 224]
+tactile_shape: &tactile_shape [1, 16, 32] 
+
+shape_meta: &shape_meta
+  obs:
+    # 三视角相机
+    head_cam:
+      shape: *image_shape
+      type: rgb
+      horizon: ${n_obs_steps}
+    left_wrist_cam:
+      shape: *image_shape
+      type: rgb
+      horizon: ${n_obs_steps}
+    right_wrist_cam:
+      shape: *image_shape
+      type: rgb
+      horizon: ${n_obs_steps}
+    
+    # 触觉传感器（标记为rgb类型用于视觉处理）
+    left_tactile:
+      shape: *tactile_shape
+      type: rgb
+      horizon: ${n_obs_steps}
+    right_tactile:
+      shape: *tactile_shape
+      type: rgb
+      horizon: ${n_obs_steps}
+    
+    # 机器人状态
+    agent_pos:
+      shape: [14]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  
+  action:
+    shape: [14]
+    horizon: ${horizon}
+
+env_runner:
+  _target_: maniflow.env_runner.robotwin_runner.RobotRunner
+  max_steps: 300
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  task_name: robot
+
+dataset:
+  _target_: maniflow.dataset.robotwin_image_dataset.RoboTwinImageDataset
+  zarr_path: data/${task.name}.zarr
+  horizon: ${horizon}
+  n_obs_steps: ${n_obs_steps}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 0
+  val_ratio: 0.02
+  max_train_episodes: null
+  shape_meta: ${shape_meta}
+  
+  # 数据key映射
+  obs_key_mapping:
+    head_cam: head_camera
+    left_wrist_cam: left_camera
+    right_wrist_cam: right_camera
+    left_tactile: left_tactile_sensor
+    right_tactile: right_tactile_sensor
+    agent_pos: state
+  state_key: state
+  action_key: action
+

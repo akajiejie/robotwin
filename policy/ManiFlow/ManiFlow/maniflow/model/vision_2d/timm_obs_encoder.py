@@ -247,15 +247,28 @@ class TimmObsEncoder(ModuleAttrMixin):
     def aggregate_feature(self, feature):
         if self.model_name == 'r3m':
             return feature
-        if self.model_name.startswith('vit') or 'siglip' in self.model_name.lower():
-            # ViT and SigLIP models use CLS token by default
+        
+        # Handle SigLIP models (no CLS token, use mean pooling)
+        if 'siglip' in self.model_name.lower():
+            if self.feature_aggregation == 'avg' or self.feature_aggregation is None:
+                # SigLIP doesn't have CLS token, use mean pooling over all tokens
+                return torch.mean(feature, dim=1)  # B, N, D -> B, D
+            elif self.feature_aggregation == 'all_tokens':
+                # Return all tokens (for transformer-based downstream processing)
+                return feature
+            else:
+                logger.warn(f'SigLIP uses mean pooling by default. feature_aggregation ({self.feature_aggregation}) may not work as expected!')
+                return torch.mean(feature, dim=1)
+        
+        # Handle ViT models (has CLS token)
+        if self.model_name.startswith('vit'):
             if self.feature_aggregation is None or self.feature_aggregation == 'cls_token':
                 return feature[:, 0, :]  # Use CLS token
             elif self.feature_aggregation == 'all_tokens':
                 # Return all tokens (for transformer-based downstream processing)
                 return feature
             else:
-                logger.warn(f'ViT/SigLIP will use the CLS token. feature_aggregation ({self.feature_aggregation}) is ignored!')
+                logger.warn(f'ViT will use the CLS token. feature_aggregation ({self.feature_aggregation}) is ignored!')
                 return feature[:, 0, :]
         
         # resnet
@@ -318,6 +331,8 @@ class TimmObsEncoder(ModuleAttrMixin):
             
             assert img.shape[1:] == self.key_shape_map[key]
             img = self.key_transform_map[key](img).to(self.device)
+            # Ensure the image is float32 to match model weights
+            img = img.float()
             raw_feature = self.key_model_map[key](img).to(self.device)
             feature = self.aggregate_feature(raw_feature)
             assert len(feature.shape) == 2 and feature.shape[0] == B * T

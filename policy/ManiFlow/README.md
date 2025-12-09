@@ -1,93 +1,55 @@
-# ManiFlow: A Dexterous Manipulation Policy via Consistency Flow Training (CoRL 2025)
+# ManiFlow: A General Robot Manipulation Policy via Consistency Flow Training
 
 <div align="center">
-  <img src="maniflow_pipeline.jpg" alt="ManiFlow Pipeline" width="100%">
+  <img src="assets/robotwin2.png" alt="maniflow_robotwin2" width="100%">
 </div>
-
----
 
 ## 🔥 Overview
 
-ManiFlow is a **visual imitation learning algorithm** for dexterous robotic manipulation using Flow Matching with a consistency training objective. Our approach enables efficient learning of high-dimensional dexterous behavior across multiple robot platforms.
+ManiFlow is a visuomotor imitation learning policy for general robot manipulation that generates precise, high-dimensional, and dexterous actions from visual, language, and proprioceptive inputs. It features a general architecture supporting both 2D and 3D inputs, combines flow matching with consistency training for 1-2 step inference, and demonstrates strong scaling behavior and generalization across diverse robots and environments.
 
-### Key Achievements
-- **60+ simulation tasks** validated
-- **8 real-world scenarios** tested  
-- **98.3% improvement** over existing approaches in real-world settings
-- **Multi-platform support**: Franka, bimanual Ability hands, and Unitree H1 humanoid robot with Inspire hands
+Unlike the large-scale pre-trained π0, ManiFlow is trained from scratch with point cloud input — yet it shows **superior efficiency**, **robustness** and **strong scaling capability** with demonstrations:
+
+- On the RoboTwin 2.0 benchmark, ManiFlow consistently outperforms π0 on bimanual dexterous tasks, even under heavy domain randomization (clutter, novel objects, diverse backgrounds, lighting changes, table height shifts).
+
+- With only 50 demonstrations per task, ManiFlow maintains high success rates across these challenging conditions, demonstrating strong learning efficiency and generalization.
+
+- From 10 to 500 demos on the single task, ManiFlow consistently outperforms π0. It scales smoothly with more data, reaching >99% success on a single task and surpassing π0 in both low-data and large-scale regimes
+
+In this codebase, we provide support for training and evaluating [ManiFlow policy](https://github.com/geyan21/ManiFlow_Policy) on the [RoboTwin2.0](https://github.com/robotwin-Platform/RoboTwin) platform.
 
 ---
 
 ## 📋 Table of Contents
-- [Installation](#installation)
-- [Data Preparation](#data-preparation)
-- [Training](#training)
-- [Evaluation](#evaluation)
-- [Repository Status](#repository-status)
-- [Contact](#contact)
+- [Installation](#-installation)
+- [Data Preparation](#-data-preparation)
+- [Training and Evaluation](#-training-and-evaluation)
 
 ---
 
 ## 🛠️ Installation
 
-### Prerequisites
-- Docker installed on your system
-- AWS CLI configured (for data download)
+You can set up and run ManiFlow in the RoboTwin environment using either **Conda** or **Docker**.  
+- For Docker setup instructions, see the [Docker guide](Docker.md).  
+- For Conda setup instructions, see the [INSTALL guide](INSTALL.md).
 
-### Setup Steps
-1. **Clone and navigate to the repository**
-   ```bash
-   cd YOUR_PATH_TO_RoboTwin
-   ```
 
-2. **Build the Docker image**
-   ```bash
-   cd Docker
-   bash BUILD_DOCKER_IMAGE.sh
-   ```
-
-3. **Configure and run the container (only run once)**
-   ```bash
-   # ⚠️ Important: Update $LOCAL_PATH in these scripts to your repo path
-   # Edit RUN_DOCKER_CONTAINER.sh and initialize-docker-container.sh
-   # Add WANDB_API_KEY in initialize-docker-container.sh if you want to use Weights & Biases
-   bash RUN_DOCKER_CONTAINER.sh
-   ```
-
-4. **Enter the container**
-   ```bash
-   # For subsequent runs
-   docker exec -it robotwin_container bash
-   cd YOUR_PATH_TO_RoboTwin  # Should match $LOCAL_PATH from step 3
-   ```
+### Download Assets
+```bash
+cd RoboTwin # go back to the root folder of RoboTwin
+bash script/_download_assets.sh
+```
 
 ---
 
 ## 📊 Data Preparation
 
-You have two options for obtaining training data:
-
-### Option 1: Use Pre-processed Data (Recommended)
-Download our pre-processed dataset from AWS S3:
-
 ```bash
-# Set your data directory path
-DATA_DIR=/home/geyan/projects/RoboTwin/policy/ManiFlow/data  # Update to your path
-
-# Download pre-processed data (excludes outputs folder)
-aws s3 sync s3://tri-ml-datasets/robotwin/maniflow_zarr_data/ $DATA_DIR/ --exclude "outputs/*"
-```
-
-### Option 2: Collect and Process Your Own Data
-If you want to collect custom data:
-
-```bash
-# Download RoboTwin assets
-bash script/_download_assets.sh
 
 # 1. Collect demonstration data
+cd RoboTwin
 bash collect_data.sh lift_pot demo_randomized 0
-# Parameters: <task_name> <demo_type> <seed>
+# Parameters: <task_name> <demo_type> <gpu_id>
 
 # 2. Process collected data into zarr format
 cd policy/ManiFlow
@@ -97,81 +59,24 @@ bash process_data.sh lift_pot demo_randomized 50
 
 ---
 
-## 🚀 Training
+## 🚀 Training and Evaluation
 
-### Quick Start
 ```bash
-# Navigate to ManiFlow directory
-cd policy/ManiFlow
+# The training scripts are located in policy/ManiFlow
+# Train a ManiFlow pointcloud policy on the lift_pot task in RoboTwin
+cd RoboTwin/policy/ManiFlow/scripts
+bash train_eval_robotwin2.sh lift_pot maniflow_pointcloud_policy_robotwin2 demo_randomized 50 1004 0 0
 
-# Train a ManiFlow policy with single GPU
-bash train_eval_demo.sh lift_pot robot_maniflow demo_randomized 50 addi_info 0 0
-
-# Train a ManiFlow policy with multiple GPUs (DDP), e.g., use 2 GPUs 0 and 1
-bash train_eval_ddp_demo.sh lift_pot robot_maniflow demo_randomized 50 addi_info 0 0_1
-
+# Train a ManiFlow image policy on the lift_pot task in RoboTwin
+bash train_eval_robotwin2.sh lift_pot maniflow_image_timm_policy_robotwin2 demo_randomized 50 1004 0 0
 ```
-
-### Training Parameters
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| Task | Task name to train on | `lift_pot` |
-| Method | Algorithm variant | `robot_maniflow` |
-| Demo Type | Type of demonstrations | `demo_randomized` |
-| Num Demos | Number of demonstrations | `50` |
-| Additional Info | Extra configuration | `addi_info` |
-| Seed | Random seed | `0` |
-| GPU ID | GPU device ID | `0` |
-
-### Training Configuration
+### Script Parameters
+For more details about the parameters in the training script `train_eval_robotwin2.sh`, please refer to the comments in the script. Here are some key parameters:
 - Set `$train=true` in the script to enable training
-- Monitor training progress on Weights & Biases (configure `WANDB_API_KEY` in `initialize-docker-container.sh`)
+- Set `$eval=true` in the script to enable evaluation after training
+- `$train_task_config` is the training data type, which can be `demo_clean` or `demo_randomized`
+- `$eval_task_config` is the evaluation environment type you want to test on, which can be `demo_clean` or `demo_randomized`
 
 ---
 
-## 📈 Evaluation
-
-### Automatic Evaluation
-Remember to download the RoboTwin assets first as in [Data Preparation](#data-preparation)
-```bash
-# Set $train=false and $eval=true in train_eval_demo.sh 
-# or set $train and $eval both to true and it will run training and evaluation sequentially
-bash train_eval_demo.sh lift_pot robot_maniflow demo_randomized 50 addi_info 0 0
-```
-
-### View Results
-- **Evaluation videos**: Check the outputs directory
-  ```bash
-  # Example output path
-  /home/geyan/projects/RoboTwin/policy/ManiFlow/data/outputs/lift_pot-robot_maniflow-addi_info_seed0
-  ```
-- **Metrics**: Available on your Weights & Biases dashboard during training
-
----
-### Error Catching
-For common errors and their fixes, refer to the [ERROR_CATCH.md](ERROR_CATCH.md) file.
-
----
-
-## ⚠️ Repository Status
-
-> **Note**: This is an **initial development version** of ManiFlow.  
-> Expect ongoing improvements including:
-> - Additional testing and validation
-> - Code cleanup and optimization  
-> - Enhanced documentation
-> - New features and capabilities
-
----
-
-## 📧 Contact
-
-For questions, issues, or collaboration inquiries:
-- **Open an issue** in this repository
-- **Reach out directly** to [Ge Yan](https://geyan21.github.io/)
-
----
-
-<div align="center">
-  <i>🤖 Advancing the frontier of dexterous robotic manipulation</i>
-</div>
+Note that RoboTwin 2.0 has been actively updated from the original RoboTwin introduced in the ManiFlow paper. As a result, some performance numbers may differ between the paper and the current RoboTwin 2.0 benchmark, though the overall conclusions should remain consistent.

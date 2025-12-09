@@ -117,17 +117,6 @@ class TransformerObsEncoder(ModuleAttrMixin):
                 feature_dim = 1024
             else:
                 raise NotImplementedError(f"Unsupported downsample_ratio: {downsample_ratio}")
-        elif 'siglip' in model_name.lower():
-            # SigLIP models from timm
-            if 'base' in model_name:
-                feature_dim = 768  # SigLIP Base (86M parameters)
-            elif 'large' in model_name:
-                feature_dim = 1024  # SigLIP Large
-            elif 'so400m' in model_name:
-                feature_dim = 1152  # SigLIP So400M
-            else:
-                feature_dim = 768  # Default to base size
-            cprint(f"Using SigLIP model {model_name} with feature_dim={feature_dim}", 'green')
 
         if use_group_norm and not pretrained:
             model = replace_submodules(
@@ -140,13 +129,13 @@ class TransformerObsEncoder(ModuleAttrMixin):
             
         # handle feature aggregation
         self.feature_aggregation = feature_aggregation
-        if model_name.startswith('vit') or 'siglip' in model_name.lower():
-            # ViT and SigLIP models use CLS token by default
+        if model_name.startswith('vit'):
+            # assert self.feature_aggregation is None # vit uses the CLS token
             if self.feature_aggregation is None:
-                # Use all tokens from ViT/SigLIP
+                # Use all tokens from ViT
                 pass
             elif self.feature_aggregation != 'cls':
-                logger.warn(f'ViT/SigLIP will use the CLS token. feature_aggregation ({self.feature_aggregation}) is ignored!')
+                logger.warn(f'vit will use the CLS token. feature_aggregation ({self.feature_aggregation}) is ignored!')
                 self.feature_aggregation = 'cls'
         
         if self.feature_aggregation == 'soft_attention':
@@ -239,12 +228,12 @@ class TransformerObsEncoder(ModuleAttrMixin):
     def aggregate_feature(self, feature):
         # Return: B, N, C
         
-        if self.model_name.startswith('vit') or 'siglip' in self.model_name.lower():
-            # ViT and SigLIP models use CLS token by default
+        if self.model_name.startswith('vit'):
+            # vit uses the CLS token
             if self.feature_aggregation == 'cls':
                 return feature[:, [0], :]
             
-            # or use all tokens (for cross attention and multi-modal processing)
+            # or use all tokens
             assert self.feature_aggregation is None 
             return feature
         

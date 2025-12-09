@@ -13,7 +13,7 @@ import torch
 import dill
 from omegaconf import OmegaConf
 import pathlib
-from policy.ManiFlow.ManiFlow.train_robotwin import TrainManiFlowWorkspace
+from maniflow.workspace.train_maniflow_robotwin2_workspace import TrainManiFlowRoboTwinWorkspace
 import numpy as np
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
@@ -25,7 +25,7 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
         'maniflow', 'config'))
 )
 def main(cfg):
-    workspace = TrainManiFlowWorkspace(cfg)
+    workspace = TrainManiFlowRoboTwinWorkspace(cfg)
     workspace.eval()
 
 class ManiFlow:
@@ -38,7 +38,7 @@ class ManiFlow:
         self.num_queries = 15
         self.max_timesteps = 3000  # Large enough for deployment
         self.query_frequency = 1  # Query every step for temporal aggregation
-        self.state_dim = 14
+        self.state_dim = 14 # Example state dimension, adjust as needed
         
         # Initialize with zeros matching imitate_episodes.py format
         self.all_time_actions = torch.zeros([
@@ -90,112 +90,12 @@ class ManiFlow:
         return raw_action
 
     def get_policy_and_runner(self, cfg, usr_args, run_dir):
-        workspace = TrainManiFlowWorkspace(cfg, output_dir=run_dir)
-        policy, env_runner, epoch = workspace.get_robotwin_policy_and_runner(cfg, usr_args, mode='latest')
+        workspace = TrainManiFlowRoboTwinWorkspace(cfg, output_dir=run_dir)
+        # Get checkpoint mode from usr_args, default to 'best'
+        # Supports: 'latest', 'best', or specific epoch number (e.g., 500, '0500')
+        checkpoint_mode = usr_args.get('checkpoint_num', 'best')
+        policy, env_runner, epoch = workspace.get_policy_and_runner(cfg, usr_args, mode=checkpoint_mode)
         return policy, env_runner, epoch
 
 if __name__ == "__main__":
     main()
-
-
-# if __name__ == "__main__":
-#     import sys
-#     import os
-#     import pathlib
-
-#     ROOT_DIR = str(pathlib.Path(__file__).parent.parent.parent)
-#     sys.path.append(ROOT_DIR)
-#     os.chdir(ROOT_DIR)
-
-# import os
-# import hydra
-# import torch
-# import dill
-# from omegaconf import OmegaConf
-# import pathlib
-# from train_robotwin import TrainManiFlowWorkspace
-# import numpy as np
-
-# OmegaConf.register_new_resolver("eval", eval, replace=True)
-    
-
-# @hydra.main(
-#     version_base=None,
-#     config_path=str(pathlib.Path(__file__).parent.joinpath(
-#         'maniflow', 'config'))
-# )
-# def main(cfg):
-#     workspace = TrainManiFlowWorkspace(cfg)
-#     workspace.eval()
-
-# class ManiFlow:
-    
-#     def __init__(self, cfg, usr_args) -> None:
-#         self.policy, self.env_runner = self.get_policy_and_runner(cfg, usr_args)
-
-#         self.temporal_agg = True
-#         self.num_queries = 15
-#         self.max_timesteps = 3000  # Large enough for deployment
-#         self.query_frequency = 1  # Query every step for temporal aggregation
-#         self.state_dim = 14
-        
-#         # Initialize with zeros matching imitate_episodes.py format
-#         self.all_time_actions = torch.zeros([
-#             self.max_timesteps,
-#             self.max_timesteps + self.num_queries,
-#             self.state_dim,
-#         ])
-#         print(f"Temporal aggregation enabled with {self.num_queries} queries")
-#         self.t = 0  # Current timestep
-#         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#         self.all_time_actions = self.all_time_actions.to(self.device)
-
-#     def update_obs(self, observation):
-#         self.env_runner.update_obs(observation)
-
-#     def get_action(self, observation=None):
-#         raw_actions = self.env_runner.get_action(self.policy, observation)
-#         iter_idx = 0  # Add iteration index for temporal ensembling
-#         action_horizon = 15  # Assuming fixed horizon, adjust as needed, 16 - 1 
-#         action_dim = 14    
-#         ensemble_steps = 14  # Number of steps to ensemble over
-#         max_timesteps = 500
-#         step_lim = max_timesteps + action_horizon
-#         all_time_actions = np.zeros((step_lim, step_lim + action_horizon, action_dim))
-#         print(f"Temporal ensembling enabled with ensemble_steps={ensemble_steps}, action_horizon={action_horizon}")
-#         # Store raw actions in the buffer
-#         all_time_actions[[iter_idx], iter_idx:iter_idx + action_horizon] = raw_actions
-        
-#         # Perform temporal ensembling
-#         action_seq_for_curr_step = all_time_actions[:, iter_idx:iter_idx + action_horizon]
-#         target_pose_list = []
-        
-#         for i in range(action_horizon):
-#             actions_for_curr_step = action_seq_for_curr_step[max(0, iter_idx - ensemble_steps + 1):iter_idx + 1, i]
-#             actions_populated = np.all(actions_for_curr_step != 0, axis=1)
-#             actions_for_curr_step = actions_for_curr_step[actions_populated]
-
-#             if len(actions_for_curr_step) > 0:
-#                 k = -0.01
-#                 exp_weights = np.exp(k * np.arange(len(actions_for_curr_step)))
-#                 exp_weights = exp_weights / exp_weights.sum()
-                
-#                 # Simple weighted average across all action dimensions
-#                 weighted_action = (actions_for_curr_step * exp_weights[:, np.newaxis]).sum(axis=0, keepdims=True)
-#                 target_pose_list.append(weighted_action)
-#             else:
-#                 # If no valid actions, use the current raw action
-#                 target_pose_list.append(raw_actions[[i]])
-        
-#         actions = np.concatenate(target_pose_list, axis=0)
-#         print(f"Temporal ensembling applied at step {iter_idx}")
-        
-#         return actions
-
-#     def get_policy_and_runner(self, cfg, usr_args):
-#         workspace = TrainManiFlowWorkspace(cfg)
-#         policy, env_runner = workspace.get_robotwin_policy_and_runner(cfg, usr_args)
-#         return policy, env_runner
-
-# if __name__ == "__main__":
-#     main()

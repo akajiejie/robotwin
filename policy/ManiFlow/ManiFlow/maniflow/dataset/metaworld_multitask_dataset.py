@@ -134,12 +134,13 @@ class MetaworldMultitaskDataset(BaseDataset):
                 sample = sampler.sample_sequence(current_idx)
                 return self._sample_to_data(sample, task_name)
             current_idx -= len(sampler)
+        # If we reach here, idx is out of range
         raise IndexError("Index out of range") 
     
 
 if __name__ == "__main__":
     # Test the dataset
-    data_path = '/data/geyan21/projects/3D_Generative_Policy/3D-Diffusion-Policy/data'
+    data_path = "/path/to/metaworld/data"  # Replace with actual path
     task_names = ['assembly', 'basketball']
     dataset = MetaworldMultitaskDataset(
         data_path=data_path,

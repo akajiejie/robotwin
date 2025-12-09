@@ -1,105 +1,69 @@
-# Installing Conda Environment from Zero to Hero
+# Build Environment for ManiFlow Policy from scratch
 
-The following guidance works well for a machine with 3090/A40/A800/A100 GPU, cuda 11.7, driver 515.65.01.
+1.Install Vulkan
 
-First, git clone this repo and `cd` into it.
-
-    git clone https://github.com/YanjieZe/3D-Diffusion-Policy.git
-
-
-**Please strictly follow the guidance to avoid any potential errors. Especially, make sure Gym version is the same.**
-
-**Don't worry about the gym version now. Just install my version in `third_party/gym-0.21.0` and you will be fine.**
+    sudo apt install libvulkan1 mesa-vulkan-drivers vulkan-tools
 
 ---
 
-1.create python/pytorch env
+2.Create a conda env
+    
+    cd RoboTwin/policy/ManiFlow/scripts
 
-    conda remove -n dp3 --all
-    conda create -n dp3 python=3.8
-    conda activate dp3
+You can use a conda environment YAML file to create the env:
 
+    conda env create -f conda_environment.yaml
+    conda activate maniflow
 
----
+Or create a conda env manually:
 
-2.install torch
+    conda create -n maniflow python=3.10
+    conda activate maniflow
 
-    # if using cuda>=12.1
-    pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    # else, 
-    # just install the torch version that matches your cuda version
-
----
-
-3.install dp3
-
-    cd 3D-Diffusion-Policy && pip install -e . && cd ..
-
+    # Install additional dependencies
+    pip install -r requirements.txt
 
 ---
 
-4.install mujoco in `~/.mujoco`
+3.Install PyTorch3D, check the [official install instruction](https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md) if encountering any errors:
 
-    cd ~/.mujoco
-    wget https://github.com/deepmind/mujoco/releases/download/2.1.0/mujoco210-linux-x86_64.tar.gz -O mujoco210.tar.gz --no-check-certificate
+    pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 
-    tar -xvzf mujoco210.tar.gz
+---
 
-and put the following into your bash script (usually in `YOUR_HOME_PATH/.bashrc`). Remember to `source ~/.bashrc` to make it work and then open a new terminal.
-
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${HOME}/.mujoco/mujoco210/bin
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
-    export MUJOCO_GL=egl
-
-
-and then install mujoco-py (in the folder of `third_party`):
-
-    cd YOUR_PATH_TO_THIRD_PARTY
-    cd mujoco-py-2.1.2.14
-    pip install -e .
+4.Install Curobo
+    cd ../.. # go back to the root folder of RoboTwin
+    cd envs
+    git clone https://github.com/NVlabs/curobo.git
+    cd curobo
+    pip install -e . --no-build-isolation
     cd ../..
 
+---
+
+5.⚠️ Adjust code in sapien, mplib and curobo by using the script `scripts/modify_code.sh` to do it automatically
+
+    bash RoboTwin/policy/ManiFlow/scripts/modify_code.sh
+
+6.Install flash attention (optional)
+
+normally it is not necessary, but if you want to use it, please check the [official install instruction](https://github.com/Dao-AILab/flash-attention) for more details or run the following command:
+
+    MAX_JOBS=4 python -m pip -v install flash-attn --no-build-isolation
+
+---
+
+7.Install ManiFlow as a package
+
+    cd policy/ManiFlow && pip install -e . && cd ..
 
 ----
 
-5.install sim env
-
-    pip install setuptools==59.5.0 Cython==0.29.35 patchelf==0.17.2.0
+8.install third party packages
 
     cd third_party
-    cd dexart-release && pip install -e . && cd ..
     cd gym-0.21.0 && pip install -e . && cd ..
     cd Metaworld && pip install -e . && cd ..
-    cd rrl-dependencies && pip install -e mj_envs/. && pip install -e mjrl/. && cd ..
-
-download assets from [Google Drive](https://drive.google.com/file/d/1DxRfB4087PeM3Aejd6cR-RQVgOKdNrL4/view?usp=sharing), unzip it, and put it in `third_party/dexart-release/assets`. 
-
-download Adroit RL experts from [OneDrive](https://1drv.ms/u/s!Ag5QsBIFtRnTlFWqYWtS2wMMPKNX?e=dw8hsS), unzip it, and put the `ckpts` folder under `$YOUR_REPO_PATH/third_party/VRL3/`.
-
----
-
-6.install pytorch3d (a simplified version)
-
-    cd third_party/pytorch3d_simplified && pip install -e . && cd ..
-
-
----
-
-7.install some necessary packages
-
-    pip install zarr==2.12.0 wandb ipdb gpustat dm_control omegaconf hydra-core==1.2.0 dill==0.3.5.1 einops==0.4.1 diffusers==0.11.1 numba==0.56.4 moviepy imageio av matplotlib termcolor
-
-
----
-
-8.install our visualizer for pointclouds (optional)
-
-    pip install kaleido plotly
-    cd visualizer && pip install -e . && cd ..
-
----
-install enlight
-    
-        cd third_party/enlight-dev && pip install -e . && cd ..
+    cd rrl-dependencies && pip install -e mj_envs/. && pip install -e mjrl/. && cd ../
+    cd r3m && pip install -e . && cd ../..
 

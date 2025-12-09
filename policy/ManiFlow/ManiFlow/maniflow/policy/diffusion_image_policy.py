@@ -13,7 +13,7 @@ from maniflow.model.diffusion.mask_generator import LowdimMaskGenerator
 from maniflow.common.model_util import print_params
 from maniflow.common.pytorch_util import dict_apply
 from termcolor import cprint
-from maniflow.model.vision.timm_obs_encoder import TimmObsEncoder
+from maniflow.model.vision_2d.timm_obs_encoder import TimmObsEncoder
 import numpy as np
 
 class DiffusionImagePolicy(BasePolicy):

@@ -1,10 +1,8 @@
-from typing import Dict, List
-import torch
+from typing import List
 import numpy as np
 import tqdm
 from maniflow.env_runner.base_runner import BaseRunner
 from maniflow.env_runner.metaworld_runner import MetaworldRunner
-from maniflow.common.pytorch_util import dict_apply
 from maniflow.policy.base_policy import BasePolicy
 
 class MetaworldMultitaskRunner(BaseRunner):
@@ -23,7 +21,6 @@ class MetaworldMultitaskRunner(BaseRunner):
                 n_train=None,
                 n_test=None,
                 device="cuda:0",
-                devices=None,
                 use_point_crop=True,
                 num_points=512,
                 **kwargs

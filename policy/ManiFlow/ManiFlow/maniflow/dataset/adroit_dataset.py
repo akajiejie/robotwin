@@ -75,15 +75,15 @@ class AdroitDataset(BaseDataset):
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
-        agent_pos = sample['state'][:,].astype(np.float32) # (agent_posx2, block_posex3)
-        point_cloud = sample['point_cloud'][:,].astype(np.float32) # (T, 1024, 6)
+        agent_pos = sample['state'][:,].astype(np.float32)
+        point_cloud = sample['point_cloud'][:,].astype(np.float32)
 
         data = {
             'obs': {
-                'point_cloud': point_cloud, # T, 1024, 6
-                'agent_pos': agent_pos, # T, D_pos
+                'point_cloud': point_cloud,
+                'agent_pos': agent_pos,
             },
-            'action': sample['action'].astype(np.float32) # T, D_action
+            'action': sample['action'].astype(np.float32)
         }
         return data
     
