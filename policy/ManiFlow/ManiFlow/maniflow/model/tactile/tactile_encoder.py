@@ -201,7 +201,7 @@ class SpatialSoftmax(nn.Module):
 if __name__ == '__main__':
     print("\n=== TimmTactileEncoder 测试 ===\n")
     
-    # 构造shape_meta
+    # 构造shape_meta（触觉编码器只需要obs，不需要action）
     shape_meta = {
         'obs': {
             'head_cam': {'shape': [3, 224, 224], 'type': 'rgb', 'horizon': 2},
@@ -210,8 +210,7 @@ if __name__ == '__main__':
             'left_tactile': {'shape': [1, 16, 32], 'type': 'rgb', 'horizon': 2},
             'right_tactile': {'shape': [1, 16, 32], 'type': 'rgb', 'horizon': 2},
             'agent_pos': {'shape': [14], 'type': 'low_dim', 'horizon': 2},
-        },
-        'action': {'shape': [14], 'horizon': 16}
+        }
     }
     
     # 创建共享权重编码器（使用768维输出，与CLIP cls token对应）

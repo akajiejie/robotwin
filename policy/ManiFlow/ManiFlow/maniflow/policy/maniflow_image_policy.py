@@ -10,6 +10,7 @@ from maniflow.common.pytorch_util import dict_apply
 from maniflow.common.model_util import print_params
 from maniflow.model.vision_2d.timm_obs_encoder import TimmObsEncoder
 from maniflow.model.diffusion.ditx import DiTX
+from maniflow.model.diffusion.ditx_moe import DiTXMoE
 from maniflow.model.common.sample_util import *
 
 class ManiFlowTransformerImagePolicy(BasePolicy):
@@ -39,6 +40,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             sample_t_mode_consistency="discrete",
             sample_dt_mode_consistency="uniform", 
             sample_target_t_mode="relative", # relative, absolute
+            # MoE配置参数
+            use_modality_moe=False,
+            num_experts=8,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            moe_aux_loss_alpha=0.01,
             **kwargs):
         super().__init__()
 
@@ -63,25 +70,51 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             input_dim = action_dim
             global_cond_dim = obs_feature_dim
 
-     
-        cprint(f"[ManiFlowTransformerPointcloudPolicy] Using DiTX model", "red")
-        model = DiTX(
-            input_dim=input_dim,
-            output_dim=action_dim,
-            horizon=horizon,
-            n_obs_steps=n_obs_steps,
-            cond_dim=global_cond_dim,
-            visual_cond_len=visual_cond_len,
-            diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
-            diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
-            n_layer=n_layer,
-            n_head=n_head,
-            n_emb=n_emb,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_norm,
-            block_type=block_type,
-            language_conditioned=language_conditioned,
-        )
+        # 创建ManiFlow模型 (支持DiTX和DiTXMoE)
+        if block_type == "DiTXMoE":
+            cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTXMoE模型", "cyan")
+            model = DiTXMoE(
+                input_dim=input_dim,
+                output_dim=action_dim,
+                horizon=horizon,
+                n_obs_steps=n_obs_steps,
+                cond_dim=global_cond_dim,
+                visual_cond_len=visual_cond_len,
+                diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
+                diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
+                n_layer=n_layer,
+                n_head=n_head,
+                n_emb=n_emb,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                block_type=block_type,
+                language_conditioned=language_conditioned,
+                # MoE参数
+                use_modality_moe=use_modality_moe,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                n_shared_experts=n_shared_experts,
+                moe_aux_loss_alpha=moe_aux_loss_alpha,
+            )
+        else:
+            cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTX模型", "cyan")
+            model = DiTX(
+                input_dim=input_dim,
+                output_dim=action_dim,
+                horizon=horizon,
+                n_obs_steps=n_obs_steps,
+                cond_dim=global_cond_dim,
+                visual_cond_len=visual_cond_len,
+                diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
+                diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
+                n_layer=n_layer,
+                n_head=n_head,
+                n_emb=n_emb,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                block_type=block_type,
+                language_conditioned=language_conditioned,
+            )
         
         self.obs_encoder = obs_encoder
         self.model = model
