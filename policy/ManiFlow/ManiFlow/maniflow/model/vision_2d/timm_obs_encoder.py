@@ -77,7 +77,7 @@ class TimmObsEncoder(ModuleAttrMixin):
         """
         super().__init__()
         
-        rgb_keFys = list()
+        rgb_keys = list()
         low_dim_keys = list()
         key_model_map = nn.ModuleDict()
         key_transform_map = nn.ModuleDict()
