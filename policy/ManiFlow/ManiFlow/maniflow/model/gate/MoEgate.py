@@ -40,6 +40,17 @@ class MoEGate(nn.Module):
     
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape    
+        
+        # 处理空输入的情况（batch_size=0 或 seq_len=0）
+        if bsz == 0 or seq_len == 0:
+            # 返回空tensor，形状与输入匹配
+            device = hidden_states.device
+            dtype = hidden_states.dtype
+            topk_idx = torch.empty(bsz, seq_len, self.top_k, dtype=torch.long, device=device)
+            topk_weight = torch.empty(bsz, seq_len, self.top_k, dtype=dtype, device=device)
+            aux_loss = None if not (self.training and self.alpha > 0.0) else torch.tensor(0.0, dtype=dtype, device=device)
+            return topk_idx, topk_weight, aux_loss
+        
         # print(bsz, seq_len, h)    
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
@@ -190,11 +201,21 @@ class SparseMoeBlock(nn.Module):
         Returns:
             output: (batch_size, seq_len, embed_dim)
         """
+        # 处理空输入的情况
+        if hidden_states.numel() == 0:
+            return hidden_states
+        
         identity = hidden_states
         orig_shape = hidden_states.shape
         
         # 门控路由
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states) 
+        
+        # 如果gate返回空结果，直接返回identity
+        if topk_idx.numel() == 0:
+            if self.n_shared_experts is not None and self.n_shared_experts > 0:
+                return self.shared_experts(identity)
+            return identity
         
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         flat_topk_idx = topk_idx.view(-1)

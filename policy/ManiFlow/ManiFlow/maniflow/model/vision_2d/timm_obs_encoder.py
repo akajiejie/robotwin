@@ -204,8 +204,13 @@ class TimmObsEncoder(ModuleAttrMixin):
         self.key_shape_map = key_shape_map
         self.feature_aggregation = feature_aggregation
 
-        if model_name.startswith('vit'):
-            # assert self.feature_aggregation is None # vit uses the CLS token
+        # 🔧 修复: SigLIP模型名也包含'vit'，需要先检查SigLIP
+        if 'siglip' in model_name.lower():
+            # SigLIP使用mean pooling，不需要特殊处理feature_aggregation
+            if self.feature_aggregation not in ['avg', 'all_tokens', None]:
+                logger.warn(f'SigLIP uses mean pooling by default. feature_aggregation ({self.feature_aggregation}) may not work as expected!')
+        elif model_name.startswith('vit'):
+            # 普通ViT模型使用CLS token
             if self.feature_aggregation == 'all_tokens':
                 # Use all tokens from ViT
                 pass

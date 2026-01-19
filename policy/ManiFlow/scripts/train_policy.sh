@@ -29,7 +29,7 @@ if [ $DEBUG = True ]; then
     wandb_mode=offline
     echo -e "\033[33m=== DEBUG MODE ===\033[0m"
 else
-    wandb_mode=online
+    wandb_mode=offline
     echo -e "\033[33m=== TRAINING MODE ===\033[0m"
 fi
 

@@ -9,7 +9,7 @@
 train=true
 eval=true
 train_task_config=${3} # setting for training, demo_clean or demo_randomized, add here for clarity
-eval_task_config=demo_clean # setting for evaluation, demo_clean or demo_randomized
+eval_task_config=demo_randomized # setting for evaluation, demo_clean or demo_randomized
 
 policy_name=ManiFlow
 task_name=${1}

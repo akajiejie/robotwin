@@ -214,7 +214,15 @@ class Base_Task(gym.Env):
         sapien.render.set_camera_shader_dir("rt")
         sapien.render.set_ray_tracing_samples_per_pixel(32)
         sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        # Try to enable OIDN denoiser, disable if it fails (e.g., invalid handle error)
+        try:
+            sapien.render.set_ray_tracing_denoiser("oidn")
+        except Exception:
+            # If OIDN fails, disable denoiser to avoid "invalid handle" errors
+            try:
+                sapien.render.set_ray_tracing_denoiser(None)
+            except Exception:
+                pass  # Some versions may not support None, ignore silently
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()

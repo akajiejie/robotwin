@@ -11,7 +11,7 @@ domain_randomization:
   cluttered_table: false
   clean_background_rate: 1
   random_head_camera_dis: 0
-  random_table_height: 0.03
+  random_table_height: 0
   random_light: false
   crazy_random_light_rate: 0
 camera:
@@ -23,7 +23,7 @@ data_type:
   rgb: true
   third_view: false
   depth: false
-  pointcloud: true
+  pointcloud: false
   observer: false
   endpose: true
   qpos: true

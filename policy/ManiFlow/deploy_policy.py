@@ -38,8 +38,9 @@ def encode_obs(observation):  # Post-Process Observation
     obs['head_cam'] = head_cam
     obs['left_wrist_cam'] = left_cam
     obs['right_wrist_cam'] = right_cam
-    obs['agent_pos'] = observation['joint_action']['vector']
-    obs['point_cloud'] = observation['pointcloud']
+    # 确保 agent_pos 和 point_cloud 是 numpy 数组，而不是列表
+    obs['agent_pos'] = np.array(observation['joint_action']['vector'], dtype=np.float32)
+    obs['point_cloud'] = np.array(observation['pointcloud'], dtype=np.float32)
     return obs
 
 

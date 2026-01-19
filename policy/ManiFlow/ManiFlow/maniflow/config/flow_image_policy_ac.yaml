@@ -1,7 +1,7 @@
 defaults:
   - task: demo_task_dual_image
 
-name: train_maniflow_image_timm_policy
+name: train_maniflow_image_timm_policy_accelerate
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
@@ -17,24 +17,17 @@ obs_as_global_cond: true
 
 policy:
   _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
-  block_type: "DiTXMoE"  # 使用 MoE 版本
+  block_type: "DiTX"
   n_layer: 12  # max 28
   n_head: 8  # max 16
   n_emb: 768 # max 1152
-  visual_cond_len: 1024  # 所有相机特征concat后作为一个token，经过线性投影到n_emb维度
+  visual_cond_len: 1024 # max 1024
   max_lang_cond_len: 1024 # maximum length of language tokens
   qkv_bias: true
   qk_norm: true
 
   language_conditioned: false
   pre_norm_modality: false
-
-  # MoE 配置参数
-  use_modality_moe: true
-  num_experts: 4
-  num_experts_per_tok: 2
-  n_shared_experts: 1
-  moe_aux_loss_alpha: 0.01
 
   flow_batch_ratio: 0.75 
   consistency_batch_ratio: 0.25
@@ -48,7 +41,6 @@ policy:
   diffusion_timestep_embed_dim: 128
   diffusion_target_t_embed_dim: 128
 
-
   horizon: ${horizon}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
@@ -61,33 +53,19 @@ policy:
     _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
     shape_meta: ${shape_meta}
 
-    ##### from scratch #####
-    # model_name: 'vit_base_patch16_224'
-    # model_name: 'resnet34'
-    # model_name: 'vit_tiny_patch16_224'
-    # model_name: 'efficientnet_b0'
-    # model_name: 'efficientnet_b3'
-    # pretrained: False
-    # frozen: False
-
-    ##### from scratch #####
-    # model_name: 'resnet34.a1_in1k'
-    # model_name: 'vit_base_patch16_clip_224.openai'
-    # model_name: 'convnext_base.clip_laion2b_augreg_ft_in12k'
-    # model_name: 'vit_base_patch16_siglip_224'  # SigLIP Base 86M parameters
-    # pretrained: True
-    # frozen: False
-    
-    model_name: 'vit_base_patch16_siglip_224'
+    ##### SigLIP models from timm #####
+    model_name: 'vit_base_patch16_siglip_224'  # SigLIP Base 86M parameters
+    # model_name: 'vit_large_patch16_siglip_256'  # SigLIP Large 
+    # model_name: 'vit_so400m_patch14_siglip_224'  # SigLIP So400M
     pretrained: true
-    frozen: False
+    frozen: false
 
     global_pool: ''
 
-    feature_aggregation: 'avg'
-    position_encording: 'sinusoidal' # 'learnable' or 'sinusoidal'. it only works for transformer
+    # SigLIP doesn't have CLS token, uses mean pooling over all patch tokens
+    feature_aggregation: 'avg'  # 'avg' or null both use mean pooling for SigLIP
 
-    downsample_ratio: 32
+    downsample_ratio: 32  # Not applicable for SigLIP but kept for compatibility
 
     transforms:
       - type: RandomCrop
@@ -103,10 +81,9 @@ policy:
         saturation: 0.5
         hue: 0.08
      
-    use_group_norm: True
-    share_rgb_model: False
-    imagenet_norm: True
-
+    use_group_norm: false  # Not applicable for SigLIP
+    share_rgb_model: false
+    imagenet_norm: true  # SigLIP uses ImageNet normalization
 
 ema:
   _target_: maniflow.model.diffusion.ema_model.EMAModel
@@ -116,21 +93,22 @@ ema:
   min_value: 0.0
   max_value: 0.9999
 
+# 🔥 使用Accelerate时的配置
+# 实际batch_size = dataloader.batch_size * gradient_accumulate_every
+# 例如: 32 * 2 = 64 的等效batch size
 dataloader:
-  batch_size: 16
-  num_workers: 2
+  batch_size: 32  # 物理batch size (受显存限制)
+  num_workers: 4
   shuffle: True
   pin_memory: True
   persistent_workers: True
-  # drop_last: True
 
 val_dataloader:
-  batch_size: 16 # 128
-  num_workers: 2
+  batch_size: 32  # 验证时也使用较小的batch size
+  num_workers: 4
   shuffle: False
   pin_memory: True
   persistent_workers: False
-  # drop_last: True
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -148,10 +126,16 @@ training:
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 301
-  gradient_accumulate_every: 1
+  
+  # 🔥 Accelerate配置
+  use_accelerate: true  # 启用accelerate
+  gradient_accumulate_every: 2  # 梯度累积步数 (32 * 2 = 64 等效batch size)
+  mixed_precision: "no"  # 混合精度: "no", "fp16", "bf16"
+  use_wandb: true  # 是否使用wandb
+  
   use_ema: True
   rollout_every: 100
-  checkpoint_every: 500
+  checkpoint_every: 100
   val_every: 50
   sample_every: 5
   max_train_steps: null
@@ -163,22 +147,22 @@ logging:
   id: null
   mode: online
   name: ${training.seed}
-  project: ManiFlow_2d
+  project: ManiFlow_2d_SigLIP_Accelerate
   resume: true
   tags:
   - ${logging.project}
+  - timm_siglip_86m
+  - accelerate
 
 checkpoint:
-  save_ckpt: True # if True, save checkpoint every checkpoint_every
+  save_ckpt: True
   topk:
-    monitor_key: val_loss # test_mean_score, val_loss
-    # mode: max
-    # k: 0
-    # format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+    monitor_key: val_loss
     mode: min
     k: 1
     format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
-  save_last_ckpt: True # this only saves when save_ckpt is True
+  
+  save_last_ckpt: True
   save_last_snapshot: False
   save_every: 50
 
@@ -199,3 +183,4 @@ checkpoint_num: 500
 expert_data_num: 50
 raw_task_name: none
 setting: none
+

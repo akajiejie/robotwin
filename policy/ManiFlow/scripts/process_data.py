@@ -67,7 +67,7 @@ def main():
     zarr_data = zarr_root.create_group("data")
     zarr_meta = zarr_root.create_group("meta")
 
-    point_cloud_arrays = []
+    # point_cloud_arrays = []
     head_camera_arrays = []
     left_camera_arrays = []
     right_camera_arrays = []
@@ -102,7 +102,7 @@ def main():
             right_img_bit = image_dict_all["right_camera"][j]
 
             if j != left_gripper_all.shape[0] - 1:
-                point_cloud_arrays.append(pointcloud)
+                # point_cloud_arrays.append(pointcloud)
                 state_arrays.append(joint_state)
                 head_img = cv2.imdecode(np.frombuffer(head_img_bit, np.uint8), cv2.IMREAD_COLOR)
                 left_img = cv2.imdecode(np.frombuffer(left_img_bit, np.uint8), cv2.IMREAD_COLOR)
@@ -121,7 +121,7 @@ def main():
     try:
         episode_ends_arrays = np.array(episode_ends_arrays)
         state_arrays = np.array(state_arrays)
-        point_cloud_arrays = np.array(point_cloud_arrays)
+        # point_cloud_arrays = np.array(point_cloud_arrays)
         joint_action_arrays = np.array(joint_action_arrays)
         head_camera_arrays = np.array(head_camera_arrays)
         left_camera_arrays = np.array(left_camera_arrays)
@@ -133,7 +133,7 @@ def main():
         compressor = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
         state_chunk_size = (100, state_arrays.shape[1])
         joint_chunk_size = (100, joint_action_arrays.shape[1])
-        point_cloud_chunk_size = (100, point_cloud_arrays.shape[1])
+        # point_cloud_chunk_size = (100, point_cloud_arrays.shape[1])
         head_camera_chunk_size = (100, *head_camera_arrays.shape[1:])
         left_camera_chunk_size = (100, *left_camera_arrays.shape[1:])
         right_camera_chunk_size = (100, *right_camera_arrays.shape[1:])
@@ -159,13 +159,13 @@ def main():
             overwrite=True,
             compressor=compressor,
         )
-        zarr_data.create_dataset(
-            "point_cloud",
-            data=point_cloud_arrays,
-            chunks=point_cloud_chunk_size,
-            overwrite=True,
-            compressor=compressor,
-        )
+        # zarr_data.create_dataset(
+        #     "point_cloud",
+        #     data=point_cloud_arrays,
+        #     chunks=point_cloud_chunk_size,
+        #     overwrite=True,
+        #     compressor=compressor,
+        # )
         zarr_data.create_dataset(
             "state",
             data=state_arrays,
