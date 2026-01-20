@@ -49,7 +49,8 @@ class MoEGate(nn.Module):
             topk_idx = torch.empty(bsz, seq_len, self.top_k, dtype=torch.long, device=device)
             topk_weight = torch.empty(bsz, seq_len, self.top_k, dtype=dtype, device=device)
             aux_loss = None if not (self.training and self.alpha > 0.0) else torch.tensor(0.0, dtype=dtype, device=device)
-            return topk_idx, topk_weight, aux_loss
+            router_probs = None
+            return topk_idx, topk_weight, aux_loss, router_probs
         
         # print(bsz, seq_len, h)    
         ### compute gating score
@@ -69,6 +70,7 @@ class MoEGate(nn.Module):
             topk_weight = topk_weight / denominator
 
         ### expert-level computation auxiliary loss
+        router_probs = None  # 用于记录路由概率
         if self.training and self.alpha > 0.0:
             scores_for_aux = scores
             aux_topk = self.top_k
@@ -85,9 +87,15 @@ class MoEGate(nn.Module):
                 Pi = scores_for_aux.mean(0)
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
+            
+            # 保存路由概率用于wandb记录
+            router_probs = {
+                'expert_usage': ce.detach(),  # 每个专家被选中的频率
+                'router_scores': Pi.detach(),  # 路由概率分布
+            }
         else:
             aux_loss = None
-        return topk_idx, topk_weight, aux_loss
+        return topk_idx, topk_weight, aux_loss, router_probs
 
 
 class AddAuxiliaryLoss(torch.autograd.Function):
@@ -171,6 +179,10 @@ class SparseMoeBlock(nn.Module):
         super().__init__()
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
+        self.num_experts = num_experts
+        
+        # 用于累积MoE统计信息
+        self.moe_stats = None
         
         # 路由专家
         self.experts = nn.ModuleList([
@@ -209,7 +221,18 @@ class SparseMoeBlock(nn.Module):
         orig_shape = hidden_states.shape
         
         # 门控路由
-        topk_idx, topk_weight, aux_loss = self.gate(hidden_states) 
+        topk_idx, topk_weight, aux_loss, router_probs = self.gate(hidden_states) 
+        
+        # 保存MoE统计信息用于wandb记录
+        # 🔥 优化2: 减少CPU-GPU同步，只保留GPU tensor
+        if self.training and router_probs is not None:
+            self.moe_stats = {
+                'aux_loss': aux_loss.detach().item() if aux_loss is not None else 0.0,
+                'expert_usage': router_probs['expert_usage'],  # 保持在GPU上
+                'router_scores': router_probs['router_scores'],  # 保持在GPU上
+                'topk_weights_mean': topk_weight.mean().detach().item(),
+                'topk_weights_std': topk_weight.std().detach().item(),
+            }
         
         # 如果gate返回空结果，直接返回identity
         if topk_idx.numel() == 0:
@@ -221,11 +244,24 @@ class SparseMoeBlock(nn.Module):
         flat_topk_idx = topk_idx.view(-1)
         
         if self.training:
-            # 训练模式：动态调度专家
+            # 训练模式：并行专家调度（优化版）
             hidden_states = hidden_states.repeat_interleave(self.num_experts_per_tok, dim=0)
-            y = torch.empty_like(hidden_states, dtype=hidden_states.dtype)
-            for i, expert in enumerate(self.experts): 
-                y[flat_topk_idx == i] = expert(hidden_states[flat_topk_idx == i])
+            y = torch.empty_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
+            
+            # 🔥 优化1: 批量处理专家，减少for循环开销
+            # 将所有专家的计算合并为一个批次
+            expert_outputs = []
+            for i, expert in enumerate(self.experts):
+                mask = (flat_topk_idx == i)
+                if mask.any():
+                    expert_input = hidden_states[mask]
+                    expert_output = expert(expert_input)
+                    expert_outputs.append((mask, expert_output))
+            
+            # 批量赋值
+            for mask, output in expert_outputs:
+                y[mask] = output
+            
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
             y = AddAuxiliaryLoss.apply(y, aux_loss)

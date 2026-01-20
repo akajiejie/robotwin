@@ -560,5 +560,64 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 'bc_loss': loss.item(),
         }
         
+        # 收集 MoE 统计信息
+        if hasattr(self.model, 'blocks') and self.training:
+            moe_aux_losses = []
+            expert_usages = []
+            router_scores_list = []
+            topk_weights_means = []
+            
+            for i, block in enumerate(self.model.blocks):
+                if hasattr(block, 'mlp') and hasattr(block.mlp, 'moe_stats'):
+                    moe_stats = block.mlp.moe_stats
+                    if moe_stats:
+                        # 记录辅助损失
+                        if 'aux_loss' in moe_stats:
+                            moe_aux_losses.append(moe_stats['aux_loss'])
+                            loss_dict[f'moe/block_{i}/aux_loss'] = moe_stats['aux_loss']
+                        
+                        # 记录专家使用率
+                        if 'expert_usage' in moe_stats:
+                            expert_usage = moe_stats['expert_usage']
+                            expert_usages.append(expert_usage)
+                            # 记录每个专家的使用率
+                            for j, usage in enumerate(expert_usage):
+                                loss_dict[f'moe/block_{i}/expert_{j}_usage'] = float(usage)
+                        
+                        # 记录路由分数
+                        if 'router_scores' in moe_stats:
+                            router_scores = moe_stats['router_scores']
+                            router_scores_list.append(router_scores)
+                            # 记录每个专家的路由分数
+                            for j, score in enumerate(router_scores):
+                                loss_dict[f'moe/block_{i}/expert_{j}_router_score'] = float(score)
+                        
+                        # 记录topk权重平均值
+                        if 'topk_weights_mean' in moe_stats:
+                            topk_weights_means.append(moe_stats['topk_weights_mean'])
+                            loss_dict[f'moe/block_{i}/topk_weights_mean'] = moe_stats['topk_weights_mean']
+            
+            # 记录整体MoE统计
+            if moe_aux_losses:
+                loss_dict['moe/avg_aux_loss'] = sum(moe_aux_losses) / len(moe_aux_losses)
+            
+            if expert_usages:
+                # 计算所有block的平均专家使用率
+                avg_expert_usage = sum(expert_usages) / len(expert_usages)
+                for j, usage in enumerate(avg_expert_usage):
+                    loss_dict[f'moe/avg_expert_{j}_usage'] = float(usage)
+                # 记录专家使用的标准差（负载均衡指标）
+                loss_dict['moe/expert_usage_std'] = float(avg_expert_usage.std())
+                loss_dict['moe/expert_usage_max'] = float(avg_expert_usage.max())
+                loss_dict['moe/expert_usage_min'] = float(avg_expert_usage.min())
+            
+            if router_scores_list:
+                # 计算所有block的平均路由分数
+                avg_router_scores = sum(router_scores_list) / len(router_scores_list)
+                for j, score in enumerate(avg_router_scores):
+                    loss_dict[f'moe/avg_expert_{j}_router_score'] = float(score)
+            
+            if topk_weights_means:
+                loss_dict['moe/avg_topk_weights_mean'] = sum(topk_weights_means) / len(topk_weights_means)
 
         return loss, loss_dict

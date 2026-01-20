@@ -125,11 +125,11 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 301
+  num_epochs: 201
   
   # 🔥 Accelerate配置
   use_accelerate: true  # 启用accelerate
-  gradient_accumulate_every: 2  # 梯度累积步数 (32 * 2 = 64 等效batch size)
+  gradient_accumulate_every: 1  # 梯度累积步数 (32 * 2 = 64 等效batch size)
   mixed_precision: "no"  # 混合精度: "no", "fp16", "bf16"
   use_wandb: true  # 是否使用wandb
   

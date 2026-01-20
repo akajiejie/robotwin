@@ -1,3 +1,3 @@
-cd robotwin/policy/ManiFlow/
+cd RoboTwin/policy/ManiFlow/
 conda activate RoboTwin
-bash train_eval_robotwin2.sh place_dual_shoes maniflow_image_timm_siglip_policy_robotwin2 demo_randomized 50 0117 0 7
+bash train_eval_robotwin2.sh stack_bowls_three flowmoe_image_policy_ac demo_clean 50 0114 0 6

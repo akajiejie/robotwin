@@ -410,6 +410,19 @@ class TrainManiFlowRoboTwinWorkspace:
                     if not is_last_batch:
                         # log of last step is combined with validation and rollout
                         if WANDB and (not self.use_accelerate or self.accelerator.is_main_process):
+                            #每100步记录一次 MoE gate 权重的直方图
+                            if self.global_step % 100 == 0:
+                                if self.use_accelerate:
+                                    model_to_log = self.accelerator.unwrap_model(self.model)
+                                else:
+                                    model_to_log = self.model
+                                
+                                if hasattr(model_to_log, 'model') and hasattr(model_to_log.model, 'blocks'):
+                                    for i, block in enumerate(model_to_log.model.blocks):
+                                        if hasattr(block, 'mlp') and hasattr(block.mlp, 'gate'):
+                                            gate_weights = block.mlp.gate.weight.detach().cpu().numpy()
+                                            step_log[f'moe/block_{i}/gate_weights'] = wandb.Histogram(gate_weights)
+                            
                             wandb_run.log(step_log, step=self.global_step)
                         self.global_step += 1
 
@@ -563,6 +576,23 @@ class TrainManiFlowRoboTwinWorkspace:
             # end of epoch
             # log of last step is combined with validation and rollout
             if WANDB and (not self.use_accelerate or self.accelerator.is_main_process):
+                #每个 epoch 结束时记录 MoE 参数的详细统计
+                if self.use_accelerate:
+                    model_to_log = self.accelerator.unwrap_model(self.model)
+                else:
+                    model_to_log = self.model
+                
+                if hasattr(model_to_log, 'model') and hasattr(model_to_log.model, 'blocks'):
+                    # 记录每个block的gate权重直方图和统计信息
+                    for i, block in enumerate(model_to_log.model.blocks):
+                        if hasattr(block, 'mlp') and hasattr(block.mlp, 'gate'):
+                            gate_weights = block.mlp.gate.weight.detach().cpu().numpy()
+                            step_log[f'moe_epoch/block_{i}/gate_weights_hist'] = wandb.Histogram(gate_weights)
+                            step_log[f'moe_epoch/block_{i}/gate_weights_mean'] = float(gate_weights.mean())
+                            step_log[f'moe_epoch/block_{i}/gate_weights_std'] = float(gate_weights.std())
+                            step_log[f'moe_epoch/block_{i}/gate_weights_max'] = float(gate_weights.max())
+                            step_log[f'moe_epoch/block_{i}/gate_weights_min'] = float(gate_weights.min())
+                
                 wandb_run.log(step_log, step=self.global_step)
             self.global_step += 1
             self.epoch += 1

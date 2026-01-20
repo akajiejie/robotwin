@@ -179,7 +179,21 @@ def main(usr_args):
     with open(file_path, "w") as file:
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
+        
+        # Save policy and eval configuration
+        file.write("=== Policy Configuration ===\n")
+        if "config_name" in usr_args:
+            file.write(f"Config Name: {usr_args['config_name']}\n")
+        if "training_seed" in usr_args:
+            file.write(f"Training Seed: {usr_args['training_seed']}\n")
+        if "seed" in usr_args:
+            file.write(f"Eval Seed: {usr_args['seed']}\n")
+        if "addition_info" in usr_args:
+            file.write(f"Addition Info: {usr_args['addition_info']}\n")
+        file.write("\n")
+        
         # file.write(str(task_reward) + '\n')
+        file.write("=== Success Rate ===\n")
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
 
     print(f"Data has been saved to {file_path}")
