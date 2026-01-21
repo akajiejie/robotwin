@@ -46,6 +46,11 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             num_experts_per_tok=2,
             n_shared_experts=1,
             moe_aux_loss_alpha=0.01,
+            # 🆕 模态嵌入配置
+            use_modality_embedding=True,
+            # 🆕 模态长度配置（用于MoE路由）
+            head_cond_len=None,
+            wrist_cond_len=None,
             **kwargs):
         super().__init__()
 
@@ -70,6 +75,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             input_dim = action_dim
             global_cond_dim = obs_feature_dim
 
+        # 🆕 保存模态长度配置
+        self.head_cond_len = head_cond_len
+        self.wrist_cond_len = wrist_cond_len
+        
         # 创建ManiFlow模型 (支持DiTX和DiTXMoE)
         if block_type == "DiTXMoE":
             cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTXMoE模型", "cyan")
@@ -95,6 +104,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 num_experts_per_tok=num_experts_per_tok,
                 n_shared_experts=n_shared_experts,
                 moe_aux_loss_alpha=moe_aux_loss_alpha,
+                # 🆕 模态嵌入和长度配置
+                use_modality_embedding=use_modality_embedding,
+                head_cond_len=head_cond_len,
+                wrist_cond_len=wrist_cond_len,
             )
         else:
             cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTX模型", "cyan")
@@ -210,16 +223,27 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
 
         # condition through visual feature
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].to(device))
-        nobs_features = self.obs_encoder(this_nobs).to(device) 
-        vis_cond = nobs_features.reshape(B, -1, Do) # B, self.n_obs_steps*L, Do
+        nobs_features = self.obs_encoder(this_nobs).to(device)
+        
+        # 🆕 支持token序列输出模式
+        if hasattr(self.obs_encoder, 'output_token_sequence') and self.obs_encoder.output_token_sequence:
+            # Token序列模式: (B, L_tokens, D)
+            vis_cond = nobs_features  # 已经是正确格式
+            # 获取模态长度信息
+            modality_lens = self.obs_encoder.get_modality_info()
+        else:
+            # 原始模式: 拼接向量reshape
+            vis_cond = nobs_features.reshape(B, -1, Do)  # B, self.n_obs_steps*L, Do
+            modality_lens = None
         # empty data for action
         cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
 
-        # run sampling
+        # run sampling (🆕 传递模态长度信息)
         nsample = self.conditional_sample(
             cond_data, 
             vis_cond=vis_cond,
             lang_cond=lang_cond,
+            modality_lens=modality_lens,
             **self.kwargs)
         
         # unnormalize prediction
@@ -500,7 +524,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         this_nobs = dict_apply(nobs, 
             lambda x: x[:,:self.n_obs_steps,...].to(self.device))
         nobs_features = self.obs_encoder(this_nobs)
-        vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
+        
+        # 🆕 支持token序列输出模式
+        if hasattr(self.obs_encoder, 'output_token_sequence') and self.obs_encoder.output_token_sequence:
+            vis_cond = nobs_features  # 已经是 (B, L_tokens, D) 格式
+            modality_lens = self.obs_encoder.get_modality_info()
+        else:
+            vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
+            modality_lens = None
         
         """Get flow and consistency targets"""
         flow_batchsize = int(batch_size * self.flow_batch_ratio)
@@ -511,12 +542,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize], 
                                                     vis_cond=vis_cond[:flow_batchsize],
                                                     lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None)
+        # 🆕 传递模态长度信息给模型
         v_flow_pred = self.model(
             sample=flow_target_dict['x_t'], 
             timestep=flow_target_dict['t'].squeeze(),
             target_t=flow_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[:flow_batchsize],
-            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None)
+            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
+            modality_lens=modality_lens)
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
         # Get consistency targets
@@ -525,13 +558,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                                                                         lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
                                                                         ema_model=ema_model
                                                                         )
+        # 🆕 传递模态长度信息给模型
         v_ct_pred = self.model(
             sample=consistency_target_dict['x_t'], 
             timestep=consistency_target_dict['t'].squeeze(),
             target_t=consistency_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
             lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-            )
+            modality_lens=modality_lens)
         v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
 
         """Compute losses"""

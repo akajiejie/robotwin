@@ -245,6 +245,8 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             cross_attention_type: str='cls',
             cross_attention_num_heads: int=8,
             cross_attention_dropout: float=0.0,
+            # 🆕 模态级MoE支持
+            output_token_sequence: bool=False,
         ):
         """
         Args:
@@ -494,6 +496,19 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         self.share_rgb_model = share_rgb_model
         self.share_tactile_model = share_tactile_model
         
+        # 🆕 模态级MoE支持
+        self.output_token_sequence = output_token_sequence
+        if output_token_sequence:
+            cprint(f"✓ 启用token序列输出模式 (用于模态级MoE)", 'cyan')
+            # 创建本体感知投影层（将低维状态投影到RGB特征维度）
+            if len(low_dim_keys) > 0:
+                total_low_dim = sum(key_shape_map[k][0] if len(key_shape_map[k]) == 1 
+                                  else key_shape_map[k][-1] for k in low_dim_keys)
+                self.proprio_proj = nn.Linear(total_low_dim, rgb_feature_dim)
+                nn.init.xavier_uniform_(self.proprio_proj.weight)
+                nn.init.zeros_(self.proprio_proj.bias)
+                cprint(f"  ✓ 本体感知投影层: {total_low_dim} -> {rgb_feature_dim}", 'green')
+        
         logger.info(f"多模态编码器参数量: {sum(p.numel() for p in self.parameters()):,}")
     
     def _init_rgb_aggregation(self, feature_aggregation, feature_dim, feature_map_shape, 
@@ -657,10 +672,16 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             obs_dict: 观测字典，每个key对应(B, T, ...)的张量
             
         Returns:
-            features: 拼接后的特征向量 (B, D_total)
+            features: 拼接后的特征向量 (B, D_total) 或 token序列 (B, L_tokens, D)
         """
-        features = []
         batch_size = next(iter(obs_dict.values())).shape[0]
+        
+        # 🆕 Token序列模式（用于模态级MoE）
+        if self.output_token_sequence:
+            return self._forward_token_sequence(obs_dict, batch_size)
+        
+        # 原始模式：拼接所有特征为一个向量
+        features = []
         
         # ============ 处理RGB图像和触觉传感器（支持交叉注意力） ============
         if self.use_cross_attention and self.tactile_encoder is not None:
@@ -865,6 +886,198 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         
         return result
     
+    def _forward_token_sequence(self, obs_dict, batch_size):
+        """
+        🆕 输出token序列格式: (B, L_tokens, D)
+        
+        模态组织策略（触觉融入腕部）:
+        - head: head_cam tokens (如果有)
+        - wrist: left_wrist_cam + right_wrist_cam + 对应触觉传感器的tokens
+                (通过交叉注意力已融合，体现腕部视觉+触觉的完整感知)
+        - proprio: agent_pos tokens (投影到RGB特征维度)
+        
+        Args:
+            obs_dict: 观测字典
+            batch_size: batch大小
+            
+        Returns:
+            result: (B, L_tokens, D) token序列
+        """
+        head_tokens_list = []
+        wrist_tokens_list = []
+        proprio_features_list = []
+        
+        # 获取时间步数（从任意观测中获取）
+        time_steps = next(iter(obs_dict.values())).shape[1]
+        
+        # ============ 处理RGB图像（使用交叉注意力融合触觉） ============
+        if self.use_cross_attention and self.tactile_encoder is not None and len(self.tactile_keys) > 0:
+            # 先提取所有触觉特征的token表示
+            tactile_obs = {k: obs_dict[k] for k in self.tactile_keys if k in obs_dict}
+            tactile_features_dict = self.tactile_encoder.forward_tokens(tactile_obs) if hasattr(self.tactile_encoder, 'forward_tokens') else {}
+            
+            # 如果没有forward_tokens方法，使用普通forward
+            if not tactile_features_dict:
+                tactile_features_dict = self.tactile_encoder(tactile_obs)
+                for k, v in tactile_features_dict.items():
+                    if len(v.shape) == 2:
+                        v = v.unsqueeze(1)  # (B, D) -> (B, 1, D)
+                    tactile_features_dict[k] = v
+            
+            # ========== 左手: 腕部相机 + 触觉（交叉注意力融合） ==========
+            if self.cross_attention_left is not None and len(self.left_rgb_keys) > 0 and len(self.left_tactile_keys) > 0:
+                # 提取左手RGB tokens
+                left_rgb_tokens_list = []
+                for key in self.left_rgb_keys:
+                    tokens, B, T = self._extract_rgb_tokens(obs_dict, key)
+                    left_rgb_tokens_list.append(tokens)
+                
+                left_rgb_tokens = torch.cat(left_rgb_tokens_list, dim=1)  # (B*T, N, D)
+                
+                # 提取左手触觉tokens
+                left_tactile_tokens_list = []
+                for key in self.left_tactile_keys:
+                    if key in tactile_features_dict:
+                        tact_tok = tactile_features_dict[key]  # (B, Q, D)
+                        tact_tok = tact_tok.unsqueeze(1).expand(-1, T, -1, -1)  # (B, T, Q, D)
+                        tact_tok = tact_tok.reshape(B*T, -1, tact_tok.shape[-1])  # (B*T, Q, D)
+                        tact_tok = self.left_tactile_proj(tact_tok)
+                        left_tactile_tokens_list.append(tact_tok)
+                
+                if len(left_tactile_tokens_list) > 0:
+                    left_tactile_tokens = torch.cat(left_tactile_tokens_list, dim=1)  # (B*T, Q, D)
+                    
+                    # 🔥 交叉注意力：腕部视觉 ↔ 触觉
+                    left_rgb_tokens, left_tactile_tokens, _ = self.cross_attention_left(
+                        left_rgb_tokens, left_tactile_tokens
+                    )
+                    
+                    # 聚合为每个时间步一个token (mean pooling)
+                    left_rgb_token_agg = torch.mean(left_rgb_tokens, dim=1)  # (B*T, D)
+                    left_tactile_token_agg = torch.mean(left_tactile_tokens, dim=1)  # (B*T, D)
+                    
+                    # 合并腕部+触觉：拼接后再投影，或直接相加（相加更简洁）
+                    left_wrist_fused = (left_rgb_token_agg + left_tactile_token_agg) / 2  # (B*T, D)
+                    left_wrist_fused = left_wrist_fused.reshape(B, T, -1)  # (B, T, D)
+                    
+                    wrist_tokens_list.append(left_wrist_fused)
+            
+            # ========== 右手: 腕部相机 + 触觉（交叉注意力融合） ==========
+            if self.cross_attention_right is not None and len(self.right_rgb_keys) > 0 and len(self.right_tactile_keys) > 0:
+                # 提取右手RGB tokens
+                right_rgb_tokens_list = []
+                for key in self.right_rgb_keys:
+                    tokens, B, T = self._extract_rgb_tokens(obs_dict, key)
+                    right_rgb_tokens_list.append(tokens)
+                
+                right_rgb_tokens = torch.cat(right_rgb_tokens_list, dim=1)  # (B*T, N, D)
+                
+                # 提取右手触觉tokens
+                right_tactile_tokens_list = []
+                for key in self.right_tactile_keys:
+                    if key in tactile_features_dict:
+                        tact_tok = tactile_features_dict[key]  # (B, Q, D)
+                        tact_tok = tact_tok.unsqueeze(1).expand(-1, T, -1, -1)  # (B, T, Q, D)
+                        tact_tok = tact_tok.reshape(B*T, -1, tact_tok.shape[-1])  # (B*T, Q, D)
+                        tact_tok = self.right_tactile_proj(tact_tok)
+                        right_tactile_tokens_list.append(tact_tok)
+                
+                if len(right_tactile_tokens_list) > 0:
+                    right_tactile_tokens = torch.cat(right_tactile_tokens_list, dim=1)  # (B*T, Q, D)
+                    
+                    # 🔥 交叉注意力：腕部视觉 ↔ 触觉
+                    right_rgb_tokens, right_tactile_tokens, _ = self.cross_attention_right(
+                        right_rgb_tokens, right_tactile_tokens
+                    )
+                    
+                    # 聚合为每个时间步一个token
+                    right_rgb_token_agg = torch.mean(right_rgb_tokens, dim=1)  # (B*T, D)
+                    right_tactile_token_agg = torch.mean(right_tactile_tokens, dim=1)  # (B*T, D)
+                    
+                    # 合并腕部+触觉
+                    right_wrist_fused = (right_rgb_token_agg + right_tactile_token_agg) / 2  # (B*T, D)
+                    right_wrist_fused = right_wrist_fused.reshape(B, T, -1)  # (B, T, D)
+                    
+                    wrist_tokens_list.append(right_wrist_fused)
+            
+            # ========== 处理其他RGB相机（没有配对触觉的，如head_cam） ==========
+            other_rgb_keys = [k for k in self.rgb_keys 
+                            if k not in self.left_rgb_keys and k not in self.right_rgb_keys]
+            
+            for key in other_rgb_keys:
+                # 判断是否为头部相机
+                is_head_cam = 'head' in key.lower() or 'front' in key.lower()
+                
+                tokens, B, T = self._extract_rgb_tokens(obs_dict, key)
+                # 聚合为每个时间步一个token
+                token_agg = torch.mean(tokens, dim=1)  # (B*T, D)
+                token_agg = token_agg.reshape(B, T, -1)  # (B, T, D)
+                
+                if is_head_cam:
+                    head_tokens_list.append(token_agg)
+                else:
+                    wrist_tokens_list.append(token_agg)
+        
+        else:
+            # ============ 不使用交叉注意力的标准处理 ============
+            for key in self.rgb_keys:
+                is_head_cam = 'head' in key.lower() or 'front' in key.lower()
+                
+                tokens, B, T = self._extract_rgb_tokens(obs_dict, key)
+                token_agg = torch.mean(tokens, dim=1)  # (B*T, D)
+                token_agg = token_agg.reshape(B, T, -1)  # (B, T, D)
+                
+                if is_head_cam:
+                    head_tokens_list.append(token_agg)
+                else:
+                    wrist_tokens_list.append(token_agg)
+        
+        # ============ 处理低维状态（本体感知） ============
+        for key in self.low_dim_keys:
+            data = obs_dict[key].to(self.device)
+            B, T = data.shape[:2]
+            assert B == batch_size
+            proprio_features_list.append(data)  # (B, T, low_dim)
+        
+        # ============ 组装最终的token序列 ============
+        all_tokens = []
+        modality_info = {'head': 0, 'wrist': 0, 'proprio': 0}
+        
+        # Head tokens
+        if head_tokens_list:
+            head_tokens = torch.cat(head_tokens_list, dim=1)  # (B, n_head_cams*T, D)
+            all_tokens.append(head_tokens)
+            modality_info['head'] = head_tokens.shape[1]
+        
+        # Wrist tokens (包含融合后的触觉信息)
+        if wrist_tokens_list:
+            wrist_tokens = torch.cat(wrist_tokens_list, dim=1)  # (B, n_wrist_cams*T, D)
+            all_tokens.append(wrist_tokens)
+            modality_info['wrist'] = wrist_tokens.shape[1]
+        
+        # Proprio tokens (投影到RGB特征维度)
+        if proprio_features_list:
+            proprio_concat = torch.cat(proprio_features_list, dim=-1)  # (B, T, total_low_dim)
+            proprio_tokens = self.proprio_proj(proprio_concat.float())  # (B, T, D)
+            all_tokens.append(proprio_tokens)
+            modality_info['proprio'] = proprio_tokens.shape[1]
+        
+        result = torch.cat(all_tokens, dim=1)  # (B, L_total, D)
+        
+        # 保存模态信息供外部使用
+        self._last_modality_info = modality_info
+        
+        return result
+    
+    def get_modality_info(self):
+        """
+        🆕 获取最近一次forward的模态长度信息
+        
+        Returns:
+            modality_info: dict {'head': L_head, 'wrist': L_wrist, 'proprio': L_proprio}
+        """
+        return getattr(self, '_last_modality_info', None)
+    
     @torch.no_grad()
     def output_shape(self):
         """计算输出特征的形状"""
@@ -879,8 +1092,14 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             example_obs_dict[key] = this_obs
         
         example_output = self.forward(example_obs_dict)
-        assert len(example_output.shape) == 2
-        assert example_output.shape[0] == 1
+        
+        # 🆕 支持token序列模式
+        if self.output_token_sequence:
+            assert len(example_output.shape) == 3  # (B, L, D)
+            assert example_output.shape[0] == 1
+        else:
+            assert len(example_output.shape) == 2  # (B, total_dim)
+            assert example_output.shape[0] == 1
         
         return example_output.shape
 

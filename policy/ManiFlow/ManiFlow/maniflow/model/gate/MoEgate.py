@@ -18,8 +18,10 @@ class MoEGate(nn.Module):
         num_experts: 专家总数
         num_experts_per_tok: 每个token选择的专家数量
         aux_loss_alpha: 辅助损失权重
+        use_time_cond: 是否使用时间条件调制门控
     """
-    def __init__(self, embed_dim, num_experts=16, num_experts_per_tok=2, aux_loss_alpha=0.01):
+    def __init__(self, embed_dim, num_experts=16, num_experts_per_tok=2, aux_loss_alpha=0.01,
+                 use_time_cond=False):
         super().__init__()
         self.top_k = num_experts_per_tok
         self.n_routed_experts = num_experts
@@ -32,18 +34,34 @@ class MoEGate(nn.Module):
         self.norm_topk_prob = False
         self.gating_dim = embed_dim
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        
+        # 时间条件调制：让Gate感知扩散时间步
+        self.use_time_cond = use_time_cond
+        if use_time_cond:
+            # 时间条件通过调制gate权重实现
+            self.time_gate_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(embed_dim, self.n_routed_experts * 2)  # scale和shift
+            )
+            nn.init.zeros_(self.time_gate_modulation[-1].weight)
+            nn.init.zeros_(self.time_gate_modulation[-1].bias)
+        
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        import torch.nn.init  as init
+        import torch.nn.init as init
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
     
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, time_cond=None):
+        """
+        Args:
+            hidden_states: (B, L, D) 输入特征
+            time_cond: (B, D) 时间条件嵌入，用于调制门控
+        """
         bsz, seq_len, h = hidden_states.shape    
         
         # 处理空输入的情况（batch_size=0 或 seq_len=0）
         if bsz == 0 or seq_len == 0:
-            # 返回空tensor，形状与输入匹配
             device = hidden_states.device
             dtype = hidden_states.dtype
             topk_idx = torch.empty(bsz, seq_len, self.top_k, dtype=torch.long, device=device)
@@ -52,10 +70,20 @@ class MoEGate(nn.Module):
             router_probs = None
             return topk_idx, topk_weight, aux_loss, router_probs
         
-        # print(bsz, seq_len, h)    
         ### compute gating score
-        hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states, self.weight, None)
+        hidden_states_flat = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states_flat, self.weight, None)
+        
+        # 时间条件调制：根据扩散阶段调整专家偏好
+        if self.use_time_cond and time_cond is not None:
+            # time_cond: (B, D) -> modulation: (B, num_experts*2)
+            modulation = self.time_gate_modulation(time_cond)
+            scale, shift = modulation.chunk(2, dim=-1)  # (B, num_experts) each
+            # 扩展到所有token: (B, 1, num_experts) -> (B*L, num_experts)
+            scale = scale.unsqueeze(1).expand(-1, seq_len, -1).reshape(-1, self.n_routed_experts)
+            shift = shift.unsqueeze(1).expand(-1, seq_len, -1).reshape(-1, self.n_routed_experts)
+            logits = logits * (1 + scale) + shift
+        
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
         else:
@@ -69,12 +97,11 @@ class MoEGate(nn.Module):
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
 
-        ### expert-level computation auxiliary loss
-        router_probs = None  # 用于记录路由概率
+        ### expert-level computation auxiliary loss (负载均衡损失)
+        router_probs = None
         if self.training and self.alpha > 0.0:
             scores_for_aux = scores
             aux_topk = self.top_k
-            # always compute aux loss based on the naive greedy topk method
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
             if self.seq_aux:
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
@@ -88,10 +115,9 @@ class MoEGate(nn.Module):
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
             
-            # 保存路由概率用于wandb记录
             router_probs = {
-                'expert_usage': ce.detach(),  # 每个专家被选中的频率
-                'router_scores': Pi.detach(),  # 路由概率分布
+                'expert_usage': ce.detach(),
+                'router_scores': Pi.detach(),
             }
         else:
             aux_loss = None
@@ -173,13 +199,15 @@ class SparseMoeBlock(nn.Module):
         n_shared_experts: 共享专家数量 (默认2)
         pretraining_tp: 张量并行度
         aux_loss_alpha: 辅助损失权重
+        use_time_cond: 是否使用时间条件调制门控
     """
     def __init__(self, embed_dim, mlp_ratio=4, num_experts=16, num_experts_per_tok=2, 
-                 n_shared_experts=2, pretraining_tp=1, aux_loss_alpha=0.01):
+                 n_shared_experts=2, pretraining_tp=1, aux_loss_alpha=0.01, use_time_cond=False):
         super().__init__()
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
         self.num_experts = num_experts
+        self.use_time_cond = use_time_cond
         
         # 用于累积MoE统计信息
         self.moe_stats = None
@@ -192,11 +220,12 @@ class SparseMoeBlock(nn.Module):
             for i in range(num_experts)
         ])
         
-        # 门控网络
+        # 门控网络（支持时间条件）
         self.gate = MoEGate(embed_dim=embed_dim, 
                            num_experts=num_experts, 
                            num_experts_per_tok=num_experts_per_tok,
-                           aux_loss_alpha=aux_loss_alpha)
+                           aux_loss_alpha=aux_loss_alpha,
+                           use_time_cond=use_time_cond)
         
         # 共享专家
         if self.n_shared_experts is not None and self.n_shared_experts > 0:
@@ -205,10 +234,11 @@ class SparseMoeBlock(nn.Module):
                                         intermediate_size=intermediate_size, 
                                         pretraining_tp=pretraining_tp)
     
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, time_cond=None):
         """
         Args:
             hidden_states: (batch_size, seq_len, embed_dim)
+            time_cond: (batch_size, embed_dim) 时间条件嵌入
             
         Returns:
             output: (batch_size, seq_len, embed_dim)
@@ -220,16 +250,15 @@ class SparseMoeBlock(nn.Module):
         identity = hidden_states
         orig_shape = hidden_states.shape
         
-        # 门控路由
-        topk_idx, topk_weight, aux_loss, router_probs = self.gate(hidden_states) 
+        # 门控路由（传入时间条件）
+        topk_idx, topk_weight, aux_loss, router_probs = self.gate(hidden_states, time_cond) 
         
         # 保存MoE统计信息用于wandb记录
-        # 🔥 优化2: 减少CPU-GPU同步，只保留GPU tensor
         if self.training and router_probs is not None:
             self.moe_stats = {
                 'aux_loss': aux_loss.detach().item() if aux_loss is not None else 0.0,
-                'expert_usage': router_probs['expert_usage'],  # 保持在GPU上
-                'router_scores': router_probs['router_scores'],  # 保持在GPU上
+                'expert_usage': router_probs['expert_usage'],
+                'router_scores': router_probs['router_scores'],
                 'topk_weights_mean': topk_weight.mean().detach().item(),
                 'topk_weights_std': topk_weight.std().detach().item(),
             }
@@ -244,12 +273,10 @@ class SparseMoeBlock(nn.Module):
         flat_topk_idx = topk_idx.view(-1)
         
         if self.training:
-            # 训练模式：并行专家调度（优化版）
+            # 训练模式：并行专家调度
             hidden_states = hidden_states.repeat_interleave(self.num_experts_per_tok, dim=0)
             y = torch.empty_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
             
-            # 🔥 优化1: 批量处理专家，减少for循环开销
-            # 将所有专家的计算合并为一个批次
             expert_outputs = []
             for i, expert in enumerate(self.experts):
                 mask = (flat_topk_idx == i)
@@ -258,7 +285,6 @@ class SparseMoeBlock(nn.Module):
                     expert_output = expert(expert_input)
                     expert_outputs.append((mask, expert_output))
             
-            # 批量赋值
             for mask, output in expert_outputs:
                 y[mask] = output
             

@@ -39,7 +39,12 @@ class FinalLayer(nn.Module):
 class DiTXMoE(nn.Module):
     """
     DiTX模型的MoE版本，使用DiTXMoEBlock替代DiTXBlock
-    在CrossAttention之前对多模态输入应用模态专家MoE
+    
+    核心改进：
+    1. 模态级别MoE路由：按模态组合进行路由，保持模态内语义一致性
+    2. 时间条件感知：MoE门控感知扩散时间步
+    3. 模态长度传递：将模态长度信息传递给Block用于正确分割
+    4. 🆕 模态嵌入：为不同模态添加可学习的标识符，帮助MoE Gate区分模态
     """
     def __init__(
         self,
@@ -64,16 +69,41 @@ class DiTXMoE(nn.Module):
         language_model: str = "t5-small",
         # MoE specific parameters
         use_modality_moe: bool = True,
-        num_experts: int = 8,
+        num_experts: int = 4,         # 模态级MoE建议4个专家
         num_experts_per_tok: int = 2,
         n_shared_experts: int = 1,
         moe_aux_loss_alpha: float = 0.01,
+        # 模态长度配置（用于正确分割context_c）
+        head_cond_len: int = None,    # 头部相机特征长度，None则自动计算
+        wrist_cond_len: int = None,   # 腕部相机特征长度，None则自动计算
+        # 🆕 模态嵌入配置
+        use_modality_embedding: bool = True,  # 是否使用模态嵌入
     ):
         super().__init__()
         self.n_obs_steps = n_obs_steps
         self.visual_cond_len = visual_cond_len
         self.language_conditioned = language_conditioned
         self.pre_norm_modality = pre_norm_modality
+        
+        # 模态长度配置（用于MoE路由）
+        # 默认假设：visual_cond_len = head + wrist，本体感知在外部拼接
+        self.head_cond_len = head_cond_len
+        self.wrist_cond_len = wrist_cond_len
+        
+        # 🆕 模态嵌入：为不同模态添加可学习的标识符
+        self.use_modality_embedding = use_modality_embedding
+        if use_modality_embedding:
+            # 3种模态类型：head, wrist, proprio
+            self.modality_embeddings = nn.ParameterDict({
+                'head': nn.Parameter(torch.zeros(1, 1, n_emb)),    # 头部相机嵌入
+                'wrist': nn.Parameter(torch.zeros(1, 1, n_emb)),   # 腕部相机嵌入
+                'proprio': nn.Parameter(torch.zeros(1, 1, n_emb)), # 本体感知嵌入
+                'lang': nn.Parameter(torch.zeros(1, 1, n_emb)),    # 语言嵌入
+            })
+            # 初始化模态嵌入（使用较小的标准差）
+            for key in self.modality_embeddings:
+                nn.init.normal_(self.modality_embeddings[key], std=0.02)
+            cprint(f"[DiTXMoE] 初始化模态嵌入: head, wrist, proprio, lang", "cyan")
         
         # Constants
         T = horizon
@@ -323,6 +353,7 @@ class DiTXMoE(nn.Module):
             target_t: Union[torch.Tensor, float, int], 
             vis_cond: torch.Tensor,
             lang_cond: Union[torch.Tensor, list, str] = None,
+            modality_lens: dict = None,
             **kwargs):
         """
         前向传播
@@ -332,6 +363,7 @@ class DiTXMoE(nn.Module):
             target_t: (B,) or float, 目标时间步
             vis_cond: (B,L,vis_cond_dim) 多模态视觉条件
             lang_cond: (B,) or list, 语言条件
+            modality_lens: dict, 模态长度信息 {'head': L_head, 'wrist': L_wrist, 'proprio': L_proprio}
         Output: 
             action: (B,T,output_dim) 预测动作
         """
@@ -368,29 +400,91 @@ class DiTXMoE(nn.Module):
             context_c = self.vis_norm(context_c, time_c)
 
         # 4. 语言条件编码
+        lang_len = 0
         if self.language_conditioned:
             assert lang_cond is not None
             lang_c = self.encode_text_input_T5(lang_cond, output_type="token", device=sample.device)
             lang_c = self.lang_adaptor(lang_c)
             if self.pre_norm_modality:
                 lang_c = self.lang_norm(lang_c, time_c)
+            lang_len = lang_c.shape[1]
             context_c = torch.cat([context_c, lang_c], dim=1)
 
-        # 5. Transformer blocks (使用MoE处理多模态特征)
-        for block in self.blocks:
-            x = block(x, time_c, context_c)
+        # 5. 计算模态长度信息（用于MoE路由）
+        if modality_lens is None:
+            # 自动推断模态长度
+            total_vis_len = vis_cond.shape[1]
+            if self.head_cond_len is not None and self.wrist_cond_len is not None:
+                # 🔧 修正: head_cond_len和wrist_cond_len已经是每个时间步的token数
+                # vis_cond已经包含了所有时间步，所以不需要再乘以n_obs_steps
+                head_len = self.head_cond_len
+                wrist_len = self.wrist_cond_len
+            else:
+                # 默认均分视觉特征
+                head_len = total_vis_len // 2
+                wrist_len = total_vis_len - head_len
+            # 本体感知长度 = total_vis_len - head_len - wrist_len
+            proprio_len = total_vis_len - head_len - wrist_len
+            modality_lens = {'head': head_len, 'wrist': wrist_len, 'proprio': proprio_len}
+        
+        # 🆕 6. 添加模态嵌入（帮助MoE Gate区分不同模态）
+        if self.use_modality_embedding:
+            context_c = self._add_modality_embeddings(context_c, modality_lens, lang_len)
 
-        # 6. 输出层
+        # 7. Transformer blocks (使用MoE处理多模态特征，传入模态长度)
+        for block in self.blocks:
+            x = block(x, time_c, context_c, modality_lens=modality_lens)
+
+        # 8. 输出层
         x = self.final_layer(x)
         x = x[:, -self.horizon:]
         
         return x
+    
+    def _add_modality_embeddings(self, context_c, modality_lens, lang_len):
+        """
+        🆕 为context_c的不同模态区域添加模态嵌入
+        
+        Args:
+            context_c: (B, L_total, D) 多模态特征
+            modality_lens: dict 模态长度信息
+            lang_len: int 语言token长度
+        Returns:
+            context_c: (B, L_total, D) 添加模态嵌入后的特征
+        """
+        B, L, D = context_c.shape
+        head_len = modality_lens.get('head', 0)
+        wrist_len = modality_lens.get('wrist', 0)
+        proprio_len = modality_lens.get('proprio', 0)
+        
+        # 创建模态嵌入掩码
+        # context_c结构: [head_tokens, wrist_tokens, proprio_tokens, lang_tokens]
+        if head_len > 0:
+            head_emb = self.modality_embeddings['head'].expand(B, head_len, D)
+            context_c[:, :head_len] = context_c[:, :head_len] + head_emb
+        
+        if wrist_len > 0:
+            wrist_start = head_len
+            wrist_emb = self.modality_embeddings['wrist'].expand(B, wrist_len, D)
+            context_c[:, wrist_start:wrist_start+wrist_len] = context_c[:, wrist_start:wrist_start+wrist_len] + wrist_emb
+        
+        if proprio_len > 0:
+            proprio_start = head_len + wrist_len
+            proprio_emb = self.modality_embeddings['proprio'].expand(B, proprio_len, D)
+            context_c[:, proprio_start:proprio_start+proprio_len] = context_c[:, proprio_start:proprio_start+proprio_len] + proprio_emb
+        
+        if lang_len > 0:
+            lang_start = head_len + wrist_len + proprio_len
+            lang_emb = self.modality_embeddings['lang'].expand(B, lang_len, D)
+            context_c[:, lang_start:lang_start+lang_len] = context_c[:, lang_start:lang_start+lang_len] + lang_emb
+        
+        return context_c
 
 
 if __name__ == "__main__":
     """测试DiTXMoE模型"""
     print("="*80)
-    print("测试DiTXMoE模型")
+    print("测试DiTXMoE模型 (模态级别MoE + 时间条件感知)")
     print("="*80)
     
     torch.manual_seed(42)
@@ -403,13 +497,18 @@ if __name__ == "__main__":
     output_dim = 16
     cond_dim = 256
     visual_cond_len = 128
+    n_obs_steps = 2
+    
+    # 模态长度配置
+    head_cond_len = 64   # 头部相机特征长度
+    wrist_cond_len = 64  # 腕部相机特征长度
     
     # 创建DiTXMoE模型
     model_moe = DiTXMoE(
         input_dim=input_dim,
         output_dim=output_dim,
         horizon=horizon,
-        n_obs_steps=2,
+        n_obs_steps=n_obs_steps,
         cond_dim=cond_dim,
         visual_cond_len=visual_cond_len,
         diffusion_timestep_embed_dim=256,
@@ -424,29 +523,43 @@ if __name__ == "__main__":
         pre_norm_modality=False,
         # MoE配置
         use_modality_moe=True,
-        num_experts=8,
+        num_experts=4,        # 模态级MoE建议4个专家
         num_experts_per_tok=2,
         n_shared_experts=1,
         moe_aux_loss_alpha=0.01,
+        # 模态长度配置
+        head_cond_len=head_cond_len,
+        wrist_cond_len=wrist_cond_len,
     ).to(device)
     
     # 创建输入数据
     sample = torch.randn(batch_size, horizon, input_dim).to(device)
     timestep = torch.tensor([1, 2]).to(device)
     target_t = torch.tensor([0.1, 0.2]).to(device)
-    vis_cond = torch.randn(batch_size, visual_cond_len * 2, cond_dim).to(device)
+    vis_cond = torch.randn(batch_size, visual_cond_len * n_obs_steps, cond_dim).to(device)
     
     print(f"\n输入形状:")
     print(f"  sample: {sample.shape}")
     print(f"  timestep: {timestep.shape}")
     print(f"  target_t: {target_t.shape}")
     print(f"  vis_cond: {vis_cond.shape}")
+    print(f"  模态长度: head={head_cond_len*n_obs_steps}, wrist={wrist_cond_len*n_obs_steps}")
     
-    # 前向传播
-    print(f"\n前向传播...")
+    # 前向传播（训练模式）
+    print(f"\n前向传播 (训练模式)...")
+    model_moe.train()
     output = model_moe(sample, timestep, target_t, vis_cond)
     print(f"  输出形状: {output.shape}")
     assert output.shape == (batch_size, horizon, output_dim), "输出形状不匹配"
+    
+    # 检查MoE统计信息
+    print(f"\nMoE统计信息:")
+    for i, block in enumerate(model_moe.blocks):
+        if hasattr(block, 'modality_moe') and block.modality_moe.moe_stats:
+            stats = block.modality_moe.moe_stats
+            print(f"  Block {i}:")
+            print(f"    - aux_loss: {stats['aux_loss']:.6f}")
+            print(f"    - expert_usage: {[f'{u:.3f}' for u in stats['expert_usage'].tolist()]}")
     
     # 参数统计
     params_moe = sum(p.numel() for p in model_moe.parameters())
@@ -459,6 +572,14 @@ if __name__ == "__main__":
     loss = output.sum()
     loss.backward()
     print(f"  ✅ 反向传播成功")
+    
+    # 推理模式测试
+    print(f"\n推理模式测试...")
+    model_moe.eval()
+    with torch.no_grad():
+        output_eval = model_moe(sample, timestep, target_t, vis_cond)
+    print(f"  输出形状: {output_eval.shape}")
+    print(f"  ✅ 推理成功")
     
     print(f"\n" + "="*80)
     print("✅ 所有测试通过!")

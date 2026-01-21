@@ -69,6 +69,8 @@ class TimmObsEncoder(ModuleAttrMixin):
             feature_aggregation: str='spatial_embedding',
             downsample_ratio: int=32,
             position_encording: str='learnable',
+            # 🆕 输出token序列而非拼接向量（用于模态级MoE）
+            output_token_sequence: bool=False,
 
         ):
         """
@@ -245,6 +247,10 @@ class TimmObsEncoder(ModuleAttrMixin):
                 num_heads=feature_dim // 64,
                 output_dim=feature_dim
             )
+        # 🆕 输出token序列模式
+        self.output_token_sequence = output_token_sequence
+        self.imagenet_norm = imagenet_norm
+        
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
@@ -305,8 +311,14 @@ class TimmObsEncoder(ModuleAttrMixin):
             return feature
         
     def forward(self, obs_dict):
-        features = list()
         batch_size = next(iter(obs_dict.values())).shape[0]
+        
+        # 🆕 Token序列模式：分别收集不同模态的特征
+        if self.output_token_sequence:
+            return self._forward_token_sequence(obs_dict, batch_size)
+        
+        # 原始模式：拼接所有特征为一个向量
+        features = list()
         
         # process rgb input
         for key in self.rgb_keys:
@@ -356,6 +368,130 @@ class TimmObsEncoder(ModuleAttrMixin):
 
         return result
     
+    def _forward_token_sequence(self, obs_dict, batch_size):
+        """
+        🆕 输出token序列格式: (B, L_tokens, D)
+        
+        每个相机输出1个token (mean pooling后)，每个时间步的低维状态输出1个token
+        输出顺序: [head_cam_t0, head_cam_t1, ..., wrist_cam_t0, wrist_cam_t1, ..., proprio_t0, proprio_t1, ...]
+        
+        Returns:
+            result: (B, L_tokens, D) token序列
+            modality_info: dict 包含模态长度信息
+        """
+        head_features = []   # 头部相机特征
+        wrist_features = []  # 腕部相机特征
+        proprio_features = []  # 本体感知特征
+        
+        # 按相机类型分类
+        head_keys = [k for k in self.rgb_keys if 'head' in k.lower() or 'front' in k.lower()]
+        wrist_keys = [k for k in self.rgb_keys if 'wrist' in k.lower() or 'hand' in k.lower() or 'left' in k.lower() or 'right' in k.lower()]
+        # 如果没有明确分类，默认第一个为head，其余为wrist
+        if not head_keys and not wrist_keys:
+            head_keys = self.rgb_keys[:1] if len(self.rgb_keys) >= 1 else []
+            wrist_keys = self.rgb_keys[1:] if len(self.rgb_keys) > 1 else []
+        
+        # 处理头部相机
+        for key in head_keys:
+            feature = self._process_single_rgb(obs_dict[key], key, batch_size)
+            head_features.append(feature)  # (B, T, D)
+        
+        # 处理腕部相机
+        for key in wrist_keys:
+            feature = self._process_single_rgb(obs_dict[key], key, batch_size)
+            wrist_features.append(feature)  # (B, T, D)
+        
+        # 处理低维状态（本体感知）
+        for key in self.low_dim_keys:
+            data = obs_dict[key].to(self.device)
+            B, T = data.shape[:2]
+            assert B == batch_size
+            # 将低维状态投影到feature_dim维度
+            # data: (B, T, low_dim) -> (B, T, D)
+            # 这里需要一个投影层，如果没有则保持原样
+            proprio_features.append(data)  # (B, T, low_dim)
+        
+        # 合并特征
+        # head: (B, n_head_cams * T, D)
+        if head_features:
+            head_tokens = torch.cat(head_features, dim=1)  # (B, n_head * T, D)
+        else:
+            head_tokens = None
+            
+        # wrist: (B, n_wrist_cams * T, D)
+        if wrist_features:
+            wrist_tokens = torch.cat(wrist_features, dim=1)  # (B, n_wrist * T, D)
+        else:
+            wrist_tokens = None
+        
+        # proprio: (B, T, low_dim) - 需要投影到D维度
+        if proprio_features:
+            proprio_concat = torch.cat(proprio_features, dim=-1)  # (B, T, total_low_dim)
+            # 投影到feature_dim（如果需要）
+            if not hasattr(self, 'proprio_proj'):
+                total_low_dim = proprio_concat.shape[-1]
+                self.proprio_proj = nn.Linear(total_low_dim, self.feature_dim).to(self.device)
+                nn.init.xavier_uniform_(self.proprio_proj.weight)
+                nn.init.zeros_(self.proprio_proj.bias)
+            proprio_tokens = self.proprio_proj(proprio_concat.float())  # (B, T, D)
+        else:
+            proprio_tokens = None
+        
+        # 拼接所有token: [head, wrist, proprio]
+        all_tokens = []
+        modality_info = {'head': 0, 'wrist': 0, 'proprio': 0}
+        
+        if head_tokens is not None:
+            all_tokens.append(head_tokens)
+            modality_info['head'] = head_tokens.shape[1]
+        if wrist_tokens is not None:
+            all_tokens.append(wrist_tokens)
+            modality_info['wrist'] = wrist_tokens.shape[1]
+        if proprio_tokens is not None:
+            all_tokens.append(proprio_tokens)
+            modality_info['proprio'] = proprio_tokens.shape[1]
+        
+        result = torch.cat(all_tokens, dim=1)  # (B, L_total, D)
+        
+        # 保存模态信息供外部使用
+        self._last_modality_info = modality_info
+        
+        return result
+    
+    def _process_single_rgb(self, img, key, batch_size):
+        """处理单个RGB输入，返回(B, T, D)格式的特征"""
+        # normalize image by hand
+        if img.max() > 1.0:
+            img = img / 255.0
+        if img.shape[-1] == 3:
+            if len(img.shape) == 5:
+                img = img.permute(0, 1, 4, 2, 3)
+            elif len(img.shape) == 4:
+                img = img.permute(0, 3, 1, 2)
+        
+        B, T = img.shape[:2]
+        assert B == batch_size
+        img = img.reshape(B*T, *img.shape[2:])
+        
+        if img.shape[2:] != self.key_shape_map[key]:
+            target_H, target_W = self.key_shape_map[key][1], self.key_shape_map[key][2]
+            img = F.interpolate(img, size=(target_H, target_W), mode='bilinear', align_corners=False)
+        
+        assert img.shape[1:] == self.key_shape_map[key]
+        img = self.key_transform_map[key](img).to(self.device)
+        img = img.float()
+        raw_feature = self.key_model_map[key](img).to(self.device)
+        
+        # Mean pooling得到每帧一个token
+        feature = self.aggregate_feature(raw_feature)  # (B*T, D)
+        feature = feature.reshape(B, T, -1)  # (B, T, D)
+        
+        return feature
+    
+    def get_modality_info(self):
+        """获取最近一次forward的模态长度信息"""
+        return getattr(self, '_last_modality_info', None)
+    
 
     @torch.no_grad()
     def output_shape(self):
@@ -369,8 +505,14 @@ class TimmObsEncoder(ModuleAttrMixin):
                 device=self.device)
             example_obs_dict[key] = this_obs
         example_output = self.forward(example_obs_dict)
-        assert len(example_output.shape) == 2
-        assert example_output.shape[0] == 1
+        
+        # 🆕 支持token序列模式
+        if self.output_token_sequence:
+            assert len(example_output.shape) == 3  # (B, L, D)
+            assert example_output.shape[0] == 1
+        else:
+            assert len(example_output.shape) == 2  # (B, total_dim)
+            assert example_output.shape[0] == 1
         
         return example_output.shape
 

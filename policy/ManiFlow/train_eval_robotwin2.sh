@@ -6,8 +6,8 @@
 # bash train_eval_robotwin2.sh lift_pot maniflow_image_transformer_policy_robotwin2 demo_randomized 50 1112 0 0
 
 
-train=false
-eval=true
+train=true
+eval=false
 train_task_config=${3} # setting for training, demo_clean or demo_randomized, add here for clarity
 eval_task_config=demo_clean # setting for evaluation, demo_clean or demo_randomized
 

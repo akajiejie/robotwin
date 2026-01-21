@@ -1,0 +1,226 @@
+defaults:
+  - task: demo_task_dual_image
+
+name: train_maniflow_modality_moe_image_timm_policy_accelerate
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "debug"
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 16
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: true
+
+policy:
+  _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
+  block_type: "DiTXMoE"  # 使用DiTXMoE (内部已改为模态级别MoE)
+  n_layer: 12  # max 28
+  n_head: 8  # max 16
+  n_emb: 768 # max 1152
+  
+  # 🔥 视觉条件长度配置 (output_token_sequence=true模式)
+  # TimmObsEncoder + output_token_sequence=true 输出:
+  #   - 每个相机每个时间步输出1个768维token
+  #   - 3相机 × 2时间步 = 6个RGB tokens
+  #   - 低维状态投影后: 2时间步 = 2个proprio tokens
+  # 总计: visual_cond_len = 6 + 2 = 8 tokens
+  visual_cond_len: 8  # 🔥 3相机×2时间步 + 2时间步proprio = 8 tokens
+  
+  max_lang_cond_len: 1024 # maximum length of language tokens
+  qkv_bias: true
+  qk_norm: true
+
+  language_conditioned: false
+  pre_norm_modality: false
+
+  # 🔥 模态级别MoE配置 (ModalityMoE)
+  # 核心改进:
+  # 1. 按模态组合路由(全模态/头部+本体/腕部+本体)，而非token级别
+  # 2. 时间条件感知：门控根据扩散阶段调整专家选择
+  # 3. AdaLN协调：context_c在进入MoE前感知时间条件
+  use_modality_moe: true  # 启用模态专家MoE
+  num_experts: 4  # 🔥 模态级MoE建议4个专家 (对应不同模态组合策略)
+  num_experts_per_tok: 2  # 每次激活2个专家 (top-k)
+  n_shared_experts: 1  # 共享专家数量 (始终激活，学习通用特征)
+  moe_aux_loss_alpha: 0.01  # 负载均衡损失权重
+
+  # 🔥 模态嵌入配置 (帮助MoE Gate区分不同模态)
+  use_modality_embedding: true  # 为head/wrist/proprio添加可学习的模态标识符
+  
+  # 🔥 模态长度配置 (用于正确分割context_c)
+  # 当前配置 (3相机, n_obs_steps=2, output_token_sequence=true):
+  #   - head_cam: 1相机 × 2时间步 = 2 tokens
+  #   - left_wrist_cam + right_wrist_cam: 2相机 × 2时间步 = 4 tokens
+  #   - 低维状态(agent_pos): 投影后 = 2 tokens
+  # ⚠️ 注意: head_cond_len和wrist_cond_len是vis_cond中的总token数，已包含所有时间步
+  # context_c结构: [head_t0, head_t1, wrist_l_t0, wrist_l_t1, wrist_r_t0, wrist_r_t1, proprio_t0, proprio_t1]
+  head_cond_len: 2   # 🔥 头部相机总token数 (1相机 × 2时间步)
+  wrist_cond_len: 4  # 🔥 腕部相机总token数 (2相机 × 2时间步)
+
+  flow_batch_ratio: 0.75 
+  consistency_batch_ratio: 0.25
+
+  sample_t_mode_flow: "beta" # choose between beta or lognorm, both are performing well
+  sample_t_mode_consistency: "discrete" 
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative" # "absolute", "relative"
+  denoise_timesteps: 10
+
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  obs_encoder:
+    _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+
+    ##### SigLIP models from timm #####
+    model_name: 'vit_base_patch16_siglip_224'  # SigLIP Base 86M parameters
+    # model_name: 'vit_large_patch16_siglip_256'  # SigLIP Large 
+    # model_name: 'vit_so400m_patch14_siglip_224'  # SigLIP So400M
+    pretrained: true
+    frozen: false
+
+    global_pool: ''
+
+    # SigLIP doesn't have CLS token, uses mean pooling over all patch tokens
+    feature_aggregation: 'avg'  # 'avg' or null both use mean pooling for SigLIP
+    
+    # 🔥 输出token序列模式 (用于模态级MoE)
+    # 启用后输出格式: (B, L_tokens, D) 而非拼接向量
+    # 每个相机输出1个token，低维状态投影到D维后作为proprio tokens
+    output_token_sequence: true
+
+    downsample_ratio: 32  # Not applicable for SigLIP but kept for compatibility
+
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees:
+          - -5.0
+          - 5.0
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+     
+    use_group_norm: false  # Not applicable for SigLIP
+    share_rgb_model: false
+    imagenet_norm: true  # SigLIP uses ImageNet normalization
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+# 🔥 使用Accelerate时的配置
+# 实际batch_size = dataloader.batch_size * gradient_accumulate_every
+# 模态级MoE参数量更少，可以使用更大的batch size
+dataloader:
+  batch_size: 1  # 🔥 模态级MoE参数更少，可增大batch size
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 1
+  num_workers: 2
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+training:
+  device: "cuda:0"
+  env_device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 201
+  
+  # 🔥 Accelerate配置
+  use_accelerate: true
+  gradient_accumulate_every: 32  # 🔥 4 * 8 = 32 等效batch size
+  mixed_precision: "no"  # 混合精度: "no", "fp16", "bf16"
+  use_wandb: true
+  
+  use_ema: True
+  rollout_every: 100
+  checkpoint_every: 100
+  val_every: 50
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${training.seed}
+  project: ManiFlow_2d_SigLIP_ModalityMoE_Accelerate
+  resume: true
+  tags:
+  - ${logging.project}
+  - timm_siglip_86m
+  - modality_moe  # 🔥 标记为模态级MoE
+  - time_cond_aware  # 🔥 时间条件感知
+  - accelerate
+  - triple_camera
+
+checkpoint:
+  save_ckpt: True
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 1
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  
+  save_last_ckpt: True
+  save_last_snapshot: False
+  save_every: 50
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+checkpoint_num: 500
+expert_data_num: 50
+raw_task_name: none
+setting: none
+
