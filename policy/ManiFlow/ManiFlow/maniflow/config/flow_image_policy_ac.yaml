@@ -164,7 +164,7 @@ checkpoint:
   
   save_last_ckpt: True
   save_last_snapshot: False
-  save_every: 50
+  save_every: 100
 
 multi_run:
   run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}

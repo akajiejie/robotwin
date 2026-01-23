@@ -419,7 +419,17 @@ class TrainManiFlowRoboTwinWorkspace:
                                 
                                 if hasattr(model_to_log, 'model') and hasattr(model_to_log.model, 'blocks'):
                                     for i, block in enumerate(model_to_log.model.blocks):
-                                        if hasattr(block, 'mlp') and hasattr(block.mlp, 'gate'):
+                                        # 支持两种MoE结构：
+                                        # 1. DiTXMoE: block.modality_moe.gate_proj
+                                        # 2. SparseMoeBlock: block.mlp.gate.weight
+                                        if hasattr(block, 'modality_moe') and hasattr(block.modality_moe, 'gate_proj'):
+                                            # DiTXMoE结构：模态级别MoE
+                                            gate_weights = block.modality_moe.gate_proj.weight.detach().cpu().numpy()
+                                            step_log[f'moe/block_{i}/gate_weights'] = wandb.Histogram(gate_weights)
+                                            step_log[f'moe/block_{i}/gate_weights_mean'] = float(gate_weights.mean())
+                                            step_log[f'moe/block_{i}/gate_weights_std'] = float(gate_weights.std())
+                                        elif hasattr(block, 'mlp') and hasattr(block.mlp, 'gate'):
+                                            # SparseMoeBlock结构：token级别MoE
                                             gate_weights = block.mlp.gate.weight.detach().cpu().numpy()
                                             step_log[f'moe/block_{i}/gate_weights'] = wandb.Histogram(gate_weights)
                             
@@ -585,7 +595,24 @@ class TrainManiFlowRoboTwinWorkspace:
                 if hasattr(model_to_log, 'model') and hasattr(model_to_log.model, 'blocks'):
                     # 记录每个block的gate权重直方图和统计信息
                     for i, block in enumerate(model_to_log.model.blocks):
-                        if hasattr(block, 'mlp') and hasattr(block.mlp, 'gate'):
+                        # 支持两种MoE结构：
+                        # 1. DiTXMoE: block.modality_moe.gate_proj
+                        # 2. SparseMoeBlock: block.mlp.gate.weight
+                        if hasattr(block, 'modality_moe') and hasattr(block.modality_moe, 'gate_proj'):
+                            # DiTXMoE结构：模态级别MoE
+                            gate_weights = block.modality_moe.gate_proj.weight.detach().cpu().numpy()
+                            step_log[f'moe_epoch/block_{i}/gate_weights_hist'] = wandb.Histogram(gate_weights)
+                            step_log[f'moe_epoch/block_{i}/gate_weights_mean'] = float(gate_weights.mean())
+                            step_log[f'moe_epoch/block_{i}/gate_weights_std'] = float(gate_weights.std())
+                            step_log[f'moe_epoch/block_{i}/gate_weights_max'] = float(gate_weights.max())
+                            step_log[f'moe_epoch/block_{i}/gate_weights_min'] = float(gate_weights.min())
+                            # 记录时间条件调制权重（如果存在）
+                            if hasattr(block.modality_moe, 'time_gate_modulation'):
+                                time_mod_weights = block.modality_moe.time_gate_modulation[-1].weight.detach().cpu().numpy()
+                                step_log[f'moe_epoch/block_{i}/time_mod_weights_hist'] = wandb.Histogram(time_mod_weights)
+                                step_log[f'moe_epoch/block_{i}/time_mod_weights_mean'] = float(time_mod_weights.mean())
+                        elif hasattr(block, 'mlp') and hasattr(block.mlp, 'gate'):
+                            # SparseMoeBlock结构：token级别MoE
                             gate_weights = block.mlp.gate.weight.detach().cpu().numpy()
                             step_log[f'moe_epoch/block_{i}/gate_weights_hist'] = wandb.Histogram(gate_weights)
                             step_log[f'moe_epoch/block_{i}/gate_weights_mean'] = float(gate_weights.mean())

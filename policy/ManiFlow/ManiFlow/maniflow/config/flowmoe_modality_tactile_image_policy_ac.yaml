@@ -1,5 +1,5 @@
 defaults:
-  - task: demo_task_dual_image
+  - task: demo_task_tactile
 
 name: train_maniflow_modality_moe_tactile_image_timm_policy_accelerate
 
@@ -44,11 +44,13 @@ policy:
   # 2. 按模态组合路由(全模态/头部+本体/腕部+触觉+本体)
   # 3. 时间条件感知：门控根据扩散阶段调整专家选择
   # 4. AdaLN协调：context_c在进入MoE前感知时间条件
+  # 5. 🆕 梯度累积友好：跨micro-batch累积专家统计，负载均衡更稳定
   use_modality_moe: true
   num_experts: 4
   num_experts_per_tok: 2
   n_shared_experts: 1
   moe_aux_loss_alpha: 0.01
+  enable_grad_accumulation: true  # 🔥 启用梯度累积友好模式 (gradient_accumulate_every=2时必须开启)
 
   # 🔥 模态嵌入配置
   use_modality_embedding: true
@@ -83,7 +85,7 @@ policy:
   shape_meta: ${shape_meta}
 
   obs_encoder:
-    _target_: manifold.model.vision_2d.timm_multimodal_encoder.TimmMultimodalEncoder
+    _target_: maniflow.model.vision_2d.timm_multimodal_encoder.TimmMultimodalEncoder
     shape_meta: ${shape_meta}
 
     ##### RGB相机配置 (SigLIP) #####
@@ -98,7 +100,7 @@ policy:
     tactile_model_name: 'resnet18'
     tactile_pretrained: false
     tactile_frozen: false
-    tactile_feature_dim: 512  # 投影到RGB特征维度 (768)
+    tactile_feature_dim: 768  # 与SigLIP Base RGB特征维度一致
     share_tactile_model: true  # 左右手触觉共享权重
 
     ##### 🔥 交叉注意力配置 (触觉融入腕部) #####
@@ -138,14 +140,14 @@ ema:
 
 # 🔥 Accelerate配置 (触觉MoE可能需要更多内存)
 dataloader:
-  batch_size: 1  # 触觉交叉注意力增加计算量
+  batch_size: 16  # 触觉交叉注意力增加计算量
   num_workers: 4
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
-  batch_size: 1
+  batch_size: 16
   num_workers: 2
   shuffle: False
   pin_memory: True
@@ -170,7 +172,7 @@ training:
   
   # 🔥 Accelerate配置
   use_accelerate: true
-  gradient_accumulate_every: 32  # 等效batch size 32
+  gradient_accumulate_every: 2  # 等效batch size 32
   mixed_precision: "no"
   use_wandb: true
   

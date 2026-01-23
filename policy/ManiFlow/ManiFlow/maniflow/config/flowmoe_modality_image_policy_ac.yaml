@@ -42,11 +42,13 @@ policy:
   # 1. 按模态组合路由(全模态/头部+本体/腕部+本体)，而非token级别
   # 2. 时间条件感知：门控根据扩散阶段调整专家选择
   # 3. AdaLN协调：context_c在进入MoE前感知时间条件
+  # 4. 🆕 梯度累积友好：跨micro-batch累积专家统计，负载均衡更稳定
   use_modality_moe: true  # 启用模态专家MoE
   num_experts: 4  # 🔥 模态级MoE建议4个专家 (对应不同模态组合策略)
   num_experts_per_tok: 2  # 每次激活2个专家 (top-k)
   n_shared_experts: 1  # 共享专家数量 (始终激活，学习通用特征)
   moe_aux_loss_alpha: 0.01  # 负载均衡损失权重
+  enable_grad_accumulation: true  # 🔥 启用梯度累积友好模式 (gradient_accumulate_every=2时必须开启)
 
   # 🔥 模态嵌入配置 (帮助MoE Gate区分不同模态)
   use_modality_embedding: true  # 为head/wrist/proprio添加可学习的模态标识符
@@ -134,14 +136,14 @@ ema:
 # 实际batch_size = dataloader.batch_size * gradient_accumulate_every
 # 模态级MoE参数量更少，可以使用更大的batch size
 dataloader:
-  batch_size: 1  # 🔥 模态级MoE参数更少，可增大batch size
+  batch_size: 16  # 🔥 模态级MoE参数更少，可增大batch size
   num_workers: 4
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
-  batch_size: 1
+  batch_size: 16
   num_workers: 2
   shuffle: False
   pin_memory: True
@@ -166,7 +168,7 @@ training:
   
   # 🔥 Accelerate配置
   use_accelerate: true
-  gradient_accumulate_every: 32  # 🔥 4 * 8 = 32 等效batch size
+  gradient_accumulate_every: 2  # 🔥 4 * 8 = 32 等效batch size
   mixed_precision: "no"  # 混合精度: "no", "fp16", "bf16"
   use_wandb: true
   

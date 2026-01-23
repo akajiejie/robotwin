@@ -73,6 +73,7 @@ class DiTXMoE(nn.Module):
         num_experts_per_tok: int = 2,
         n_shared_experts: int = 1,
         moe_aux_loss_alpha: float = 0.01,
+        enable_grad_accumulation: bool = False,  # 🔥 梯度累积支持
         # 模态长度配置（用于正确分割context_c）
         head_cond_len: int = None,    # 头部相机特征长度，None则自动计算
         wrist_cond_len: int = None,   # 腕部相机特征长度，None则自动计算
@@ -84,6 +85,7 @@ class DiTXMoE(nn.Module):
         self.visual_cond_len = visual_cond_len
         self.language_conditioned = language_conditioned
         self.pre_norm_modality = pre_norm_modality
+        self.enable_grad_accumulation = enable_grad_accumulation
         
         # 模态长度配置（用于MoE路由）
         # 默认假设：visual_cond_len = head + wrist，本体感知在外部拼接
@@ -167,6 +169,7 @@ class DiTXMoE(nn.Module):
                     num_experts_per_tok=num_experts_per_tok,
                     n_shared_experts=n_shared_experts,
                     moe_aux_loss_alpha=moe_aux_loss_alpha,
+                    enable_grad_accumulation=enable_grad_accumulation,  # 🔥 传递梯度累积配置
                 ) for _ in range(n_layer)
             ])
             cprint(f"[DiTXMoE] 初始化{n_layer}个DiTXMoE块: hidden_size={n_emb}, num_heads={n_head}, "
@@ -346,6 +349,13 @@ class DiTXMoE(nn.Module):
         optim_groups = self.get_optim_groups(weight_decay=weight_decay)
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
+    
+    def reset_moe_accumulation(self):
+        """重置所有MoE blocks的累积统计（在optimizer.step()后调用）"""
+        if self.enable_grad_accumulation:
+            for block in self.blocks:
+                if hasattr(block, 'reset_moe_accumulation'):
+                    block.reset_moe_accumulation()
 
     def forward(self, 
             sample: torch.Tensor, 

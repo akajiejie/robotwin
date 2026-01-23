@@ -83,7 +83,8 @@ class ModalityMoE(nn.Module):
         use_time_cond: 是否使用时间条件调制
     """
     def __init__(self, embed_dim, num_experts=4, num_experts_per_tok=2, 
-                 n_shared_experts=1, aux_loss_alpha=0.01, use_time_cond=True):
+                 n_shared_experts=1, aux_loss_alpha=0.01, use_time_cond=True,
+                 enable_grad_accumulation=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_experts = num_experts
@@ -91,6 +92,7 @@ class ModalityMoE(nn.Module):
         self.n_shared_experts = n_shared_experts
         self.aux_loss_alpha = aux_loss_alpha
         self.use_time_cond = use_time_cond
+        self.enable_grad_accumulation = enable_grad_accumulation
         
         # 模态级别门控：输入为模态聚合特征
         # 3个模态组合的聚合特征 -> 专家选择
@@ -104,6 +106,12 @@ class ModalityMoE(nn.Module):
             )
             nn.init.zeros_(self.time_gate_modulation[-1].weight)
             nn.init.zeros_(self.time_gate_modulation[-1].bias)
+        
+        # 梯度累积支持：累积多个micro-batch的统计信息
+        if enable_grad_accumulation:
+            self.register_buffer('_accumulated_expert_usage', torch.zeros(num_experts))
+            self.register_buffer('_accumulated_router_prob', torch.zeros(num_experts))
+            self.register_buffer('_accumulated_samples', torch.zeros(1))
         
         # 专家网络：每个专家处理完整的context_c
         mlp_hidden = int(embed_dim * 4)
@@ -129,6 +137,13 @@ class ModalityMoE(nn.Module):
         self.moe_stats = None
         
         self._init_weights()
+    
+    def reset_accumulation(self):
+        """重置累积的统计信息（在optimizer.step()后调用）"""
+        if self.enable_grad_accumulation:
+            self._accumulated_expert_usage.zero_()
+            self._accumulated_router_prob.zero_()
+            self._accumulated_samples.zero_()
     
     def _init_weights(self):
         for expert in self.experts:
@@ -252,13 +267,40 @@ class ModalityMoE(nn.Module):
         
         # 计算负载均衡损失
         if self.training and self.aux_loss_alpha > 0:
-            # 专家使用频率
-            expert_mask = F.one_hot(topk_indices.view(-1), num_classes=self.num_experts).float()
-            expert_usage = expert_mask.mean(0)
-            # 路由概率
-            router_prob = gate_scores.mean(0)
-            # 负载均衡损失
-            aux_loss = (expert_usage * router_prob).sum() * self.num_experts * self.aux_loss_alpha
+            if self.enable_grad_accumulation:
+                # 梯度累积模式：累积统计信息
+                with torch.no_grad():
+                    # 累积专家使用频率
+                    expert_mask = F.one_hot(topk_indices.view(-1), num_classes=self.num_experts).float()
+                    expert_usage_batch = expert_mask.sum(0)  # (num_experts,)
+                    self._accumulated_expert_usage += expert_usage_batch
+                    
+                    # 累积路由概率
+                    router_prob_batch = gate_scores.sum(0)  # (num_experts,)
+                    self._accumulated_router_prob += router_prob_batch
+                    
+                    # 累积样本数
+                    num_samples = B * self.num_experts_per_tok
+                    self._accumulated_samples += num_samples
+                
+                # 基于累积统计计算负载均衡损失
+                if self._accumulated_samples > 0:
+                    expert_usage = self._accumulated_expert_usage / self._accumulated_samples.clamp(min=1.0)
+                    router_prob = self._accumulated_router_prob / (self._accumulated_samples.clamp(min=1.0) / self.num_experts_per_tok)
+                    aux_loss = (expert_usage * router_prob).sum() * self.num_experts * self.aux_loss_alpha
+                else:
+                    aux_loss = torch.tensor(0.0, device=context_c.device, dtype=context_c.dtype)
+                    expert_usage = torch.zeros(self.num_experts, device=context_c.device)
+                    router_prob = torch.zeros(self.num_experts, device=context_c.device)
+            else:
+                # 标准模式：每个batch独立计算
+                # 专家使用频率
+                expert_mask = F.one_hot(topk_indices.view(-1), num_classes=self.num_experts).float()
+                expert_usage = expert_mask.mean(0)
+                # 路由概率
+                router_prob = gate_scores.mean(0)
+                # 负载均衡损失
+                aux_loss = (expert_usage * router_prob).sum() * self.num_experts * self.aux_loss_alpha
             
             # 计算topk_weights统计 (处理batch_size=1的情况)
             topk_mean = topk_weights.mean().detach().item()
@@ -380,6 +422,7 @@ class DiTXMoEBlock(nn.Module):
                 num_experts_per_tok=2,
                 n_shared_experts=1,
                 moe_aux_loss_alpha=0.01,
+                enable_grad_accumulation=False,  # 🔥 梯度累积支持
                 
                 # 其他参数
                 p_drop_attn=0.1,
@@ -390,6 +433,7 @@ class DiTXMoEBlock(nn.Module):
         
         self.hidden_size = hidden_size
         self.use_modality_moe = use_modality_moe
+        self.enable_grad_accumulation = enable_grad_accumulation
 
         # Self-Attention
         self.self_attn = nn.MultiheadAttention(
@@ -406,12 +450,14 @@ class DiTXMoEBlock(nn.Module):
                 num_experts_per_tok=num_experts_per_tok,
                 n_shared_experts=n_shared_experts,
                 aux_loss_alpha=moe_aux_loss_alpha,
-                use_time_cond=True  # 启用时间条件感知
+                use_time_cond=True,  # 启用时间条件感知
+                enable_grad_accumulation=enable_grad_accumulation  # 🔥 传递梯度累积配置
             )
             # context_c的AdaLN：让MoE输入感知时间条件
             self.context_adaln = AdaptiveLayerNorm(dim=hidden_size, dim_cond=hidden_size)
             logger.info(f"[DiTXMoEBlock] Initialized ModalityMoE with {num_experts} experts, "
-                       f"top-{num_experts_per_tok}, {n_shared_experts} shared, time_cond=True")
+                       f"top-{num_experts_per_tok}, {n_shared_experts} shared, time_cond=True, "
+                       f"grad_accum={enable_grad_accumulation}")
         
         # Cross-Attention
         self.cross_attn = CrossAttention(
@@ -444,6 +490,11 @@ class DiTXMoEBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, modulation_size, bias=True)
         )
+    
+    def reset_moe_accumulation(self):
+        """重置MoE的累积统计（在optimizer.step()后调用）"""
+        if self.use_modality_moe and self.enable_grad_accumulation:
+            self.modality_moe.reset_accumulation()
         
     def forward(self, x, time_c, context_c, attn_mask=None, modality_lens=None):
         """

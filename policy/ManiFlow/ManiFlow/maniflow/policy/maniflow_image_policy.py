@@ -46,6 +46,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             num_experts_per_tok=2,
             n_shared_experts=1,
             moe_aux_loss_alpha=0.01,
+            enable_grad_accumulation=False,  # 🔥 梯度累积支持
             # 🆕 模态嵌入配置
             use_modality_embedding=True,
             # 🆕 模态长度配置（用于MoE路由）
@@ -53,6 +54,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             wrist_cond_len=None,
             **kwargs):
         super().__init__()
+        
+        # 保存梯度累积配置
+        self.enable_grad_accumulation = enable_grad_accumulation
 
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
@@ -104,6 +108,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 num_experts_per_tok=num_experts_per_tok,
                 n_shared_experts=n_shared_experts,
                 moe_aux_loss_alpha=moe_aux_loss_alpha,
+                enable_grad_accumulation=enable_grad_accumulation,  # 🔥 梯度累积
                 # 🆕 模态嵌入和长度配置
                 use_modality_embedding=use_modality_embedding,
                 head_cond_len=head_cond_len,
@@ -191,6 +196,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         
         return ode_traj[-1] # sample ode returns the whole traj, return the last one
     
+    def reset_moe_accumulation(self):
+        """重置MoE的累积统计（在optimizer.step()后调用）"""
+        if self.enable_grad_accumulation and hasattr(self.model, 'reset_moe_accumulation'):
+            self.model.reset_moe_accumulation()
 
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -602,9 +611,18 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             topk_weights_means = []
             
             for i, block in enumerate(self.model.blocks):
-                if hasattr(block, 'mlp') and hasattr(block.mlp, 'moe_stats'):
+                # 支持两种MoE结构：
+                # 1. DiTXMoE: block.modality_moe.moe_stats
+                # 2. SparseMoeBlock: block.mlp.moe_stats
+                moe_stats = None
+                if hasattr(block, 'modality_moe') and hasattr(block.modality_moe, 'moe_stats'):
+                    # DiTXMoE结构：模态级别MoE
+                    moe_stats = block.modality_moe.moe_stats
+                elif hasattr(block, 'mlp') and hasattr(block.mlp, 'moe_stats'):
+                    # SparseMoeBlock结构：token级别MoE
                     moe_stats = block.mlp.moe_stats
-                    if moe_stats:
+                
+                if moe_stats:
                         # 记录辅助损失
                         if 'aux_loss' in moe_stats:
                             moe_aux_losses.append(moe_stats['aux_loss'])

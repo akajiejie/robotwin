@@ -19,9 +19,10 @@ class MoEGate(nn.Module):
         num_experts_per_tok: 每个token选择的专家数量
         aux_loss_alpha: 辅助损失权重
         use_time_cond: 是否使用时间条件调制门控
+        enable_grad_accumulation: 是否启用梯度累积友好模式
     """
     def __init__(self, embed_dim, num_experts=16, num_experts_per_tok=2, aux_loss_alpha=0.01,
-                 use_time_cond=False):
+                 use_time_cond=False, enable_grad_accumulation=False):
         super().__init__()
         self.top_k = num_experts_per_tok
         self.n_routed_experts = num_experts
@@ -46,11 +47,28 @@ class MoEGate(nn.Module):
             nn.init.zeros_(self.time_gate_modulation[-1].weight)
             nn.init.zeros_(self.time_gate_modulation[-1].bias)
         
+        # 梯度累积支持：累积多个micro-batch的统计信息
+        self.enable_grad_accumulation = enable_grad_accumulation
+        if enable_grad_accumulation:
+            # 使用buffer而非parameter，不参与梯度计算
+            self.register_buffer('_accumulated_expert_counts', torch.zeros(num_experts))
+            self.register_buffer('_accumulated_router_probs', torch.zeros(num_experts))
+            self.register_buffer('_accumulated_tokens', torch.zeros(1))
+            self.register_buffer('_accumulation_steps', torch.zeros(1, dtype=torch.long))
+        
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         import torch.nn.init as init
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    
+    def reset_accumulation(self):
+        """重置累积的统计信息（在optimizer.step()后调用）"""
+        if self.enable_grad_accumulation:
+            self._accumulated_expert_counts.zero_()
+            self._accumulated_router_probs.zero_()
+            self._accumulated_tokens.zero_()
+            self._accumulation_steps.zero_()
     
     def forward(self, hidden_states, time_cond=None):
         """
@@ -103,22 +121,59 @@ class MoEGate(nn.Module):
             scores_for_aux = scores
             aux_topk = self.top_k
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
-            if self.seq_aux:
-                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
-                ce.scatter_add_(1, topk_idx_for_aux_loss, torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(seq_len * aux_topk / self.n_routed_experts)
-                aux_loss = (ce * scores_for_seq_aux.mean(dim = 1)).sum(dim = 1).mean() * self.alpha
-            else:
-                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
-                ce = mask_ce.float().mean(0)
-                Pi = scores_for_aux.mean(0)
-                fi = ce * self.n_routed_experts
-                aux_loss = (Pi * fi).sum() * self.alpha
             
-            router_probs = {
-                'expert_usage': ce.detach(),
-                'router_scores': Pi.detach(),
-            }
+            if self.enable_grad_accumulation:
+                # 梯度累积模式：累积统计信息，延迟计算loss
+                with torch.no_grad():
+                    # 累积专家使用次数
+                    mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                    expert_counts = mask_ce.float().sum(0)  # (num_experts,)
+                    self._accumulated_expert_counts += expert_counts
+                    
+                    # 累积router概率
+                    router_scores = scores_for_aux.sum(0)  # (num_experts,)
+                    self._accumulated_router_probs += router_scores
+                    
+                    # 累积token数量
+                    num_tokens = bsz * seq_len * aux_topk
+                    self._accumulated_tokens += num_tokens
+                    self._accumulation_steps += 1
+                
+                # 计算当前累积的负载均衡损失
+                if self._accumulated_tokens > 0:
+                    # ce: 每个专家的平均负载
+                    ce = self._accumulated_expert_counts / self._accumulated_tokens.clamp(min=1.0)
+                    # Pi: 每个专家的平均路由概率
+                    Pi = self._accumulated_router_probs / (self._accumulated_tokens.clamp(min=1.0) / aux_topk)
+                    # 负载均衡损失：鼓励均匀分布
+                    fi = ce * self.n_routed_experts
+                    aux_loss = (Pi * fi).sum() * self.alpha
+                else:
+                    aux_loss = torch.tensor(0.0, device=hidden_states.device, dtype=scores.dtype)
+                
+                router_probs = {
+                    'expert_usage': ce.detach(),
+                    'router_scores': Pi.detach(),
+                    'accumulation_steps': self._accumulation_steps.item(),
+                }
+            else:
+                # 标准模式：每个batch独立计算
+                if self.seq_aux:
+                    scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                    ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                    ce.scatter_add_(1, topk_idx_for_aux_loss, torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(seq_len * aux_topk / self.n_routed_experts)
+                    aux_loss = (ce * scores_for_seq_aux.mean(dim = 1)).sum(dim = 1).mean() * self.alpha
+                else:
+                    mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                    ce = mask_ce.float().mean(0)
+                    Pi = scores_for_aux.mean(0)
+                    fi = ce * self.n_routed_experts
+                    aux_loss = (Pi * fi).sum() * self.alpha
+                
+                router_probs = {
+                    'expert_usage': ce.detach(),
+                    'router_scores': Pi.detach(),
+                }
         else:
             aux_loss = None
         return topk_idx, topk_weight, aux_loss, router_probs
@@ -200,14 +255,17 @@ class SparseMoeBlock(nn.Module):
         pretraining_tp: 张量并行度
         aux_loss_alpha: 辅助损失权重
         use_time_cond: 是否使用时间条件调制门控
+        enable_grad_accumulation: 是否启用梯度累积友好模式
     """
     def __init__(self, embed_dim, mlp_ratio=4, num_experts=16, num_experts_per_tok=2, 
-                 n_shared_experts=2, pretraining_tp=1, aux_loss_alpha=0.01, use_time_cond=False):
+                 n_shared_experts=2, pretraining_tp=1, aux_loss_alpha=0.01, use_time_cond=False,
+                 enable_grad_accumulation=False):
         super().__init__()
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
         self.num_experts = num_experts
         self.use_time_cond = use_time_cond
+        self.enable_grad_accumulation = enable_grad_accumulation
         
         # 用于累积MoE统计信息
         self.moe_stats = None
@@ -220,12 +278,13 @@ class SparseMoeBlock(nn.Module):
             for i in range(num_experts)
         ])
         
-        # 门控网络（支持时间条件）
+        # 门控网络（支持时间条件和梯度累积）
         self.gate = MoEGate(embed_dim=embed_dim, 
                            num_experts=num_experts, 
                            num_experts_per_tok=num_experts_per_tok,
                            aux_loss_alpha=aux_loss_alpha,
-                           use_time_cond=use_time_cond)
+                           use_time_cond=use_time_cond,
+                           enable_grad_accumulation=enable_grad_accumulation)
         
         # 共享专家
         if self.n_shared_experts is not None and self.n_shared_experts > 0:
@@ -233,6 +292,11 @@ class SparseMoeBlock(nn.Module):
             self.shared_experts = MoeMLP(hidden_size=embed_dim, 
                                         intermediate_size=intermediate_size, 
                                         pretraining_tp=pretraining_tp)
+    
+    def reset_gate_accumulation(self):
+        """重置门控网络的累积统计（在optimizer.step()后调用）"""
+        if self.enable_grad_accumulation:
+            self.gate.reset_accumulation()
     
     def forward(self, hidden_states, time_cond=None):
         """
