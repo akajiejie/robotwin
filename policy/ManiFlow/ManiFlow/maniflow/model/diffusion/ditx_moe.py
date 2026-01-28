@@ -41,10 +41,11 @@ class DiTXMoE(nn.Module):
     DiTX模型的MoE版本，使用DiTXMoEBlock替代DiTXBlock
     
     核心改进：
-    1. 模态级别MoE路由：按模态组合进行路由，保持模态内语义一致性
-    2. 时间条件感知：MoE门控感知扩散时间步
-    3. 模态长度传递：将模态长度信息传递给Block用于正确分割
-    4. 🆕 模态嵌入：为不同模态添加可学习的标识符，帮助MoE Gate区分模态
+    1. Token级别MoE路由：每个token独立选择专家，细粒度的特征处理
+    2. 时间条件感知：MoE门控感知扩散时间步，根据噪声阶段调整专家选择
+    3. 专家自动学习：在不同时间步下关注不同模态的token特征
+    4. Gate-Attention：Cross-attention支持可学习的gate调制（参考Qwen3）
+    5. 🆕 模态嵌入：为不同模态添加可学习的标识符，帮助模型和MoE Gate区分模态
     """
     def __init__(
         self,
@@ -68,15 +69,17 @@ class DiTXMoE(nn.Module):
         language_conditioned: bool = False,
         language_model: str = "t5-small",
         # MoE specific parameters
-        use_modality_moe: bool = True,
-        num_experts: int = 4,         # 模态级MoE建议4个专家
+        use_token_moe: bool = True,       # 🔥 改名：强调token级别
+        num_experts: int = 8,             # Token级MoE建议8-16个专家（比模态级更多）
         num_experts_per_tok: int = 2,
         n_shared_experts: int = 1,
         moe_aux_loss_alpha: float = 0.01,
         enable_grad_accumulation: bool = False,  # 🔥 梯度累积支持
-        # 模态长度配置（用于正确分割context_c）
-        head_cond_len: int = None,    # 头部相机特征长度，None则自动计算
-        wrist_cond_len: int = None,   # 腕部相机特征长度，None则自动计算
+        # Gate-Attention配置
+        gate_type: str = 'headwise',   # 🔥 'none', 'headwise', 'elementwise'
+        # 模态长度配置（保留用于模态嵌入）
+        head_cond_len: int = None,        # 头部相机特征长度，None则自动计算
+        wrist_cond_len: int = None,       # 腕部相机特征长度，None则自动计算
         # 🆕 模态嵌入配置
         use_modality_embedding: bool = True,  # 是否使用模态嵌入
     ):
@@ -86,8 +89,9 @@ class DiTXMoE(nn.Module):
         self.language_conditioned = language_conditioned
         self.pre_norm_modality = pre_norm_modality
         self.enable_grad_accumulation = enable_grad_accumulation
+        self.gate_type = gate_type
         
-        # 模态长度配置（用于MoE路由）
+        # 模态长度配置（用于模态嵌入）
         # 默认假设：visual_cond_len = head + wrist，本体感知在外部拼接
         self.head_cond_len = head_cond_len
         self.wrist_cond_len = wrist_cond_len
@@ -164,16 +168,17 @@ class DiTXMoE(nn.Module):
                     p_drop_attn=p_drop_attn,
                     qkv_bias=qkv_bias, 
                     qk_norm=qk_norm,
-                    use_modality_moe=use_modality_moe,
+                    use_token_moe=use_token_moe,           # 🔥 改名：token级MoE
                     num_experts=num_experts,
                     num_experts_per_tok=num_experts_per_tok,
                     n_shared_experts=n_shared_experts,
                     moe_aux_loss_alpha=moe_aux_loss_alpha,
-                    enable_grad_accumulation=enable_grad_accumulation,  # 🔥 传递梯度累积配置
+                    enable_grad_accumulation=enable_grad_accumulation,  # 🔥 梯度累积支持
+                    gate_type=gate_type,                   # 🔥 Gate-Attention类型
                 ) for _ in range(n_layer)
             ])
             cprint(f"[DiTXMoE] 初始化{n_layer}个DiTXMoE块: hidden_size={n_emb}, num_heads={n_head}, "
-                   f"MoE={use_modality_moe}, experts={num_experts}, top_k={num_experts_per_tok}", "cyan")
+                   f"Token-MoE={use_token_moe}, experts={num_experts}, top_k={num_experts_per_tok}, gate={gate_type}", "cyan")
         
         # 最终输出层
         self.final_layer = FinalLayer(n_emb, output_dim)
@@ -240,13 +245,23 @@ class DiTXMoE(nn.Module):
         """权重初始化"""
         for block in self.blocks:
             # 初始化self_attn
-            nn.init.xavier_uniform_(block.self_attn.in_proj_weight)
-            if block.self_attn.in_proj_bias is not None:
-                nn.init.zeros_(block.self_attn.in_proj_bias)
-            
-            nn.init.xavier_uniform_(block.self_attn.out_proj.weight)
-            if block.self_attn.out_proj.bias is not None:
-                nn.init.zeros_(block.self_attn.out_proj.bias)
+            # FlashSelfAttention 使用 qkv 和 proj，而不是 in_proj_weight 和 out_proj
+            if hasattr(block.self_attn, 'in_proj_weight'):
+                # 标准 MultiheadAttention 格式
+                nn.init.xavier_uniform_(block.self_attn.in_proj_weight)
+                if hasattr(block.self_attn, 'in_proj_bias') and block.self_attn.in_proj_bias is not None:
+                    nn.init.zeros_(block.self_attn.in_proj_bias)
+                nn.init.xavier_uniform_(block.self_attn.out_proj.weight)
+                if hasattr(block.self_attn, 'out_proj') and block.self_attn.out_proj.bias is not None:
+                    nn.init.zeros_(block.self_attn.out_proj.bias)
+            elif hasattr(block.self_attn, 'qkv'):
+                # FlashSelfAttention 格式
+                nn.init.xavier_uniform_(block.self_attn.qkv.weight)
+                if block.self_attn.qkv.bias is not None:
+                    nn.init.zeros_(block.self_attn.qkv.bias)
+                nn.init.xavier_uniform_(block.self_attn.proj.weight)
+                if block.self_attn.proj.bias is not None:
+                    nn.init.zeros_(block.self_attn.proj.bias)
 
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -374,6 +389,7 @@ class DiTXMoE(nn.Module):
             vis_cond: (B,L,vis_cond_dim) 多模态视觉条件
             lang_cond: (B,) or list, 语言条件
             modality_lens: dict, 模态长度信息 {'head': L_head, 'wrist': L_wrist, 'proprio': L_proprio}
+                          (用于模态嵌入标识，Token级MoE会自动学习不同模态特征)
         Output: 
             action: (B,T,output_dim) 预测动作
         """
@@ -420,7 +436,7 @@ class DiTXMoE(nn.Module):
             lang_len = lang_c.shape[1]
             context_c = torch.cat([context_c, lang_c], dim=1)
 
-        # 5. 计算模态长度信息（用于MoE路由）
+        # 5. 计算模态长度信息（用于模态嵌入）
         if modality_lens is None:
             # 自动推断模态长度
             total_vis_len = vis_cond.shape[1]
@@ -437,11 +453,12 @@ class DiTXMoE(nn.Module):
             proprio_len = total_vis_len - head_len - wrist_len
             modality_lens = {'head': head_len, 'wrist': wrist_len, 'proprio': proprio_len}
         
-        # 🆕 6. 添加模态嵌入（帮助MoE Gate区分不同模态）
+        # 🆕 6. 添加模态嵌入（为不同模态添加可学习的标识符）
+        # Token级MoE会自动学习识别这些标识符，在不同时间步下关注不同模态特征
         if self.use_modality_embedding:
             context_c = self._add_modality_embeddings(context_c, modality_lens, lang_len)
 
-        # 7. Transformer blocks (使用MoE处理多模态特征，传入模态长度)
+        # 7. Transformer blocks (Token级MoE：每个token独立路由，专家自动学习特征模式)
         for block in self.blocks:
             x = block(x, time_c, context_c, modality_lens=modality_lens)
 
@@ -453,7 +470,12 @@ class DiTXMoE(nn.Module):
     
     def _add_modality_embeddings(self, context_c, modality_lens, lang_len):
         """
-        🆕 为context_c的不同模态区域添加模态嵌入
+        🆕 为context_c的不同模态区域添加模态嵌入标识符
+        
+        模态嵌入的作用：
+        1. 帮助模型区分不同模态的token（head/wrist/proprio/lang）
+        2. Token级MoE可以学习识别这些标识符，自动在不同时间步关注不同模态
+        3. 使专家选择更具可解释性（专家可能专注于特定模态）
         
         Args:
             context_c: (B, L_total, D) 多模态特征
@@ -532,14 +554,17 @@ if __name__ == "__main__":
         language_conditioned=False,
         pre_norm_modality=False,
         # MoE配置
-        use_modality_moe=True,
-        num_experts=4,        # 模态级MoE建议4个专家
+        use_token_moe=True,       # 🔥 Token级MoE
+        num_experts=8,            # Token级MoE建议8-16个专家
         num_experts_per_tok=2,
         n_shared_experts=1,
         moe_aux_loss_alpha=0.01,
+        gate_type='elementwise',  # 🔥 Gate-Attention
         # 模态长度配置
         head_cond_len=head_cond_len,
         wrist_cond_len=wrist_cond_len,
+        # 🆕 模态嵌入
+        use_modality_embedding=True,
     ).to(device)
     
     # 创建输入数据
@@ -565,11 +590,12 @@ if __name__ == "__main__":
     # 检查MoE统计信息
     print(f"\nMoE统计信息:")
     for i, block in enumerate(model_moe.blocks):
-        if hasattr(block, 'modality_moe') and block.modality_moe.moe_stats:
-            stats = block.modality_moe.moe_stats
+        moe_stats = block.get_moe_stats()
+        if moe_stats:
             print(f"  Block {i}:")
-            print(f"    - aux_loss: {stats['aux_loss']:.6f}")
-            print(f"    - expert_usage: {[f'{u:.3f}' for u in stats['expert_usage'].tolist()]}")
+            print(f"    - aux_loss: {moe_stats['aux_loss']:.6f}")
+            print(f"    - expert_usage: {[f'{u:.3f}' for u in moe_stats['expert_usage'].tolist()]}")
+            print(f"    - topk_weights_mean: {moe_stats['topk_weights_mean']:.4f}")
     
     # 参数统计
     params_moe = sum(p.numel() for p in model_moe.parameters())

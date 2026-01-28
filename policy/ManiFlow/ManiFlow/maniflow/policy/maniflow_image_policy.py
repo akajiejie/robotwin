@@ -41,15 +41,16 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             sample_dt_mode_consistency="uniform", 
             sample_target_t_mode="relative", # relative, absolute
             # MoE配置参数
-            use_modality_moe=False,
+            use_token_moe=False,             # 🔥 Token级MoE（原use_modality_moe）
             num_experts=8,
             num_experts_per_tok=2,
             n_shared_experts=1,
             moe_aux_loss_alpha=0.01,
             enable_grad_accumulation=False,  # 🔥 梯度累积支持
+            gate_type='headwise',            # 🔥 Gate-Attention类型: 'none', 'headwise', 'elementwise'
             # 🆕 模态嵌入配置
             use_modality_embedding=True,
-            # 🆕 模态长度配置（用于MoE路由）
+            # 🆕 模态长度配置（用于模态嵌入）
             head_cond_len=None,
             wrist_cond_len=None,
             **kwargs):
@@ -103,12 +104,13 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 block_type=block_type,
                 language_conditioned=language_conditioned,
                 # MoE参数
-                use_modality_moe=use_modality_moe,
+                use_token_moe=use_token_moe,               # 🔥 Token级MoE
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 n_shared_experts=n_shared_experts,
                 moe_aux_loss_alpha=moe_aux_loss_alpha,
                 enable_grad_accumulation=enable_grad_accumulation,  # 🔥 梯度累积
+                gate_type=gate_type,                       # 🔥 Gate-Attention类型
                 # 🆕 模态嵌入和长度配置
                 use_modality_embedding=use_modality_embedding,
                 head_cond_len=head_cond_len,
@@ -611,16 +613,11 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             topk_weights_means = []
             
             for i, block in enumerate(self.model.blocks):
-                # 支持两种MoE结构：
-                # 1. DiTXMoE: block.modality_moe.moe_stats
-                # 2. SparseMoeBlock: block.mlp.moe_stats
+                # 🔥 使用统一的get_moe_stats()方法获取MoE统计信息
+                # 支持Token级MoE（DiTXMoEBlock）
                 moe_stats = None
-                if hasattr(block, 'modality_moe') and hasattr(block.modality_moe, 'moe_stats'):
-                    # DiTXMoE结构：模态级别MoE
-                    moe_stats = block.modality_moe.moe_stats
-                elif hasattr(block, 'mlp') and hasattr(block.mlp, 'moe_stats'):
-                    # SparseMoeBlock结构：token级别MoE
-                    moe_stats = block.mlp.moe_stats
+                if hasattr(block, 'get_moe_stats'):
+                    moe_stats = block.get_moe_stats()
                 
                 if moe_stats:
                         # 记录辅助损失

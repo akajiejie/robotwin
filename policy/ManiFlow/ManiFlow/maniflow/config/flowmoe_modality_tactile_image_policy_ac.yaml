@@ -22,14 +22,24 @@ policy:
   n_head: 8
   n_emb: 768
   
-  # 🔥 视觉条件长度配置 (output_token_sequence=true + 触觉模式)
-  # TimmMultimodalEncoder + output_token_sequence=true 输出:
-  #   - head_cam: 1相机 × 2时间步 = 2 tokens
-  #   - left_wrist_cam + right_wrist_cam: 2相机 × 2时间步 = 4 tokens
-  #     (通过交叉注意力融合了left_tactile + right_tactile)
-  #   - agent_pos投影后: 2时间步 = 2 tokens
-  # 总计: visual_cond_len = 2 + 4 + 2 = 8 tokens
-  visual_cond_len: 8  # 🔥 head(2) + wrist+tactile(4) + proprio(2) = 8 tokens
+  # 🔥 视觉条件长度配置 (output_token_sequence=true + all_tokens模式)
+  # TimmMultimodalEncoder + output_token_sequence=true + feature_aggregation='all_tokens' 输出:
+  #   ✅ RGB相机 (SigLIP vit_base_patch16_224):
+  #     - 224×224 / 16×16 patch = 14×14 = 196 patches per image
+  #     - head_cam: 1相机 × 2时间步 × 196 patches = 392 tokens
+  #     - left_wrist_cam: 1相机 × 2时间步 × 196 patches = 392 tokens
+  #     - right_wrist_cam: 1相机 × 2时间步 × 196 patches = 392 tokens
+  #   
+  #   ✅ 触觉传感器 (ResNet18 + output_all_patches=true):
+  #     - 16×32 触觉图 / 32倍下采样 = 1×1 = 1 patch per tactile
+  #     - left_tactile: 1传感器 × 1 patch = 1 token
+  #     - right_tactile: 1传感器 × 1 patch = 1 token
+  #   
+  #   ✅ 本体感知:
+  #     - agent_pos投影后: 2时间步 = 2 tokens
+  #   
+  #   总计: visual_cond_len = 392 + 392 + 392 + 1 + 1 + 2 = 1180 tokens
+  visual_cond_len: 1180  # 🔥 head(392) + left_wrist(392) + right_wrist(392) + left_tactile(1) + right_tactile(1) + proprio(2)
   
   max_lang_cond_len: 1024
   qkv_bias: true
@@ -38,31 +48,38 @@ policy:
   language_conditioned: false
   pre_norm_modality: false
 
-  # 🔥 模态级别MoE配置 (ModalityMoE + 触觉融入腕部)
+  # 🔥 Token级别MoE配置 (SparseMoeBlock - 细粒度路由)
   # 核心改进:
-  # 1. 触觉通过交叉注意力融入腕部特征
-  # 2. 按模态组合路由(全模态/头部+本体/腕部+触觉+本体)
-  # 3. 时间条件感知：门控根据扩散阶段调整专家选择
+  # 1. Token级别路由：每个token独立选择专家，细粒度特征处理
+  # 2. 专家自动学习：在不同扩散时间步下自动关注不同模态的token特征
+  # 3. 时间条件感知：门控根据扩散阶段调整专家选择偏好
   # 4. AdaLN协调：context_c在进入MoE前感知时间条件
   # 5. 🆕 梯度累积友好：跨micro-batch累积专家统计，负载均衡更稳定
-  use_modality_moe: true
-  num_experts: 4
+  # 6. 高效并行调度：训练时专家并行处理，推理时优化调度
+  # 7. 🔥 Gate-Attention：Cross-attention输出通过可学习的gate调制（参考Qwen3）
+  use_token_moe: true         # 🔥 Token级MoE (原use_modality_moe)
+  num_experts: 4              
   num_experts_per_tok: 2
   n_shared_experts: 1
   moe_aux_loss_alpha: 0.01
   enable_grad_accumulation: true  # 🔥 启用梯度累积友好模式 (gradient_accumulate_every=2时必须开启)
+  gate_type: 'headwise'    # 🔥 Gate-Attention类型: 'none', 'headwise', 'elementwise'（参考Qwen3）
 
   # 🔥 模态嵌入配置
   use_modality_embedding: true
   
-  # 🔥 模态长度配置 (触觉融入腕部)
-  # - head_cam: 1相机 × 2时间步 = 2 tokens
-  # - wrist: (left_wrist_cam + right_wrist_cam) × 2时间步 = 4 tokens
-  #         (交叉注意力已融合触觉信息)
-  # - proprio: agent_pos × 2时间步 = 2 tokens
-  # ⚠️ context_c结构: [head_t0, head_t1, wrist_fused_t0, wrist_fused_t1, wrist_fused_t0, wrist_fused_t1, proprio_t0, proprio_t1]
-  head_cond_len: 2   # 🔥 头部相机总token数
-  wrist_cond_len: 4  # 🔥 腕部(含触觉)总token数
+  # 🔥 模态长度配置 (all_tokens模式 - 各模态独立输出)
+  # - head_cam: 1相机 × 2时间步 × 196 patches = 392 tokens
+  # - wrist: (left_wrist_cam + right_wrist_cam) × 2T × 196 patches + (left_tactile + right_tactile) × 1 patch = 785 tokens
+  #         (各模态独立输出，不做交叉注意力融合)
+  # - proprio: agent_pos × 2时间步 = 2 tokens (投影到RGB特征维度)
+  # ⚠️ context_c结构: [head_196patches_t0, head_196patches_t1, 
+  #                    left_wrist_196patches_t0, left_wrist_196patches_t1,
+  #                    right_wrist_196patches_t0, right_wrist_196patches_t1,
+  #                    left_tactile_1patch, right_tactile_1patch,
+  #                    proprio_t0, proprio_t1]
+  head_cond_len: 392   # 🔥 头部相机总token数 (1相机 × 2T × 196)
+  wrist_cond_len: 786  # 🔥 腕部视觉(784=2相机×2T×196) + 触觉(2=2传感器×1patch) 总token数
 
   flow_batch_ratio: 0.75 
   consistency_batch_ratio: 0.25
@@ -93,7 +110,7 @@ policy:
     pretrained: true
     frozen: false
     global_pool: ''
-    feature_aggregation: 'avg'  # SigLIP使用mean pooling
+    feature_aggregation: 'all_tokens'  # siglip/clip:'all_tokens'or'cls'or'avg'
     downsample_ratio: 32
 
     ##### 触觉传感器配置 #####
@@ -102,12 +119,7 @@ policy:
     tactile_frozen: false
     tactile_feature_dim: 768  # 与SigLIP Base RGB特征维度一致
     share_tactile_model: true  # 左右手触觉共享权重
-
-    ##### 🔥 交叉注意力配置 (触觉融入腕部) #####
-    use_cross_attention: true
-    cross_attention_type: 'cls'  # 'cls', 'avg', 'all_patch', 'hybrid'
-    cross_attention_num_heads: 8
-    cross_attention_dropout: 0.0
+    tactile_output_all_patches: true  # 🔥 触觉也输出所有patch tokens (16x32触觉图下采样32倍后约0.5x1像素)
 
     ##### 🔥 输出token序列模式 (用于模态级MoE) #####
     output_token_sequence: true
@@ -140,24 +152,24 @@ ema:
 
 # 🔥 Accelerate配置 (触觉MoE可能需要更多内存)
 dataloader:
-  batch_size: 16  # 触觉交叉注意力增加计算量
-  num_workers: 4
+  batch_size: 16  # 🔥 batch=1可能导致维度问题,改回2
+  num_workers: 4  # 🔥 改为0避免多进程复制数据
   shuffle: True
-  pin_memory: True
-  persistent_workers: True
+  pin_memory: False  # 🔥 关闭pin_memory节省内存
+  persistent_workers: False  # 🔥 num_workers=0时此项无效
 
 val_dataloader:
-  batch_size: 16
+  batch_size: 16  # 🔥 与训练保持一致
   num_workers: 2
   shuffle: False
-  pin_memory: True
-  persistent_workers: True
+  pin_memory: False
+  persistent_workers: False
 
 optimizer:
   _target_: torch.optim.AdamW
   lr: 1.0e-4
   betas: [0.9, 0.95]
-  eps: 1.0e-8
+  eps: 1.0e-8 
   weight_decay: 1.0e-3
 
 training:
@@ -172,11 +184,11 @@ training:
   
   # 🔥 Accelerate配置
   use_accelerate: true
-  gradient_accumulate_every: 2  # 等效batch size 32
-  mixed_precision: "no"
+  gradient_accumulate_every: 4  # 🔥 等效batch size = 2×16 = 32 (保持训练效果)
+  mixed_precision: "no"  # 🔥 启用FP16混合精度,节省50%内存 (~30-40GB)
   use_wandb: true
   
-  use_ema: True
+  use_ema: True  
   rollout_every: 100
   checkpoint_every: 100
   val_every: 50
@@ -195,10 +207,12 @@ logging:
   tags:
   - ${logging.project}
   - timm_siglip_86m
-  - modality_moe  # 🔥 模态级MoE
-  - tactile_fusion  # 🔥 触觉融合
-  - cross_attention  # 🔥 交叉注意力
-  - time_cond_aware
+  - token_moe  # 🔥 Token级MoE（细粒度路由）
+  - gate_attention  # 🔥 Gate-Attention（参考Qwen3）
+  - tactile_patches  # 🔥 触觉patch tokens
+  - all_tokens  # 🔥 RGB所有tokens
+  - time_cond_aware  # 🔥 时间条件感知
+  - expert_learning  # 🔥 专家自动学习
   - accelerate
   - triple_camera
 

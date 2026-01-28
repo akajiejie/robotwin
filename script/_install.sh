@@ -2,10 +2,18 @@ echo "Installing the necessary packages ..."
 pip install -r script/requirements.txt
 
 echo "Installing pytorch3d ..."
-# cd third_party/pytorch3d_simplified
-# pip install -e .
-# cd ../..
-pip install --extra-index-url https://miropsota.github.io/torch_packages_builder pytorch3d==0.7.8+pt2.4.0cu124
+# for BlackWeek, we need to clone pytorch3d locally and install from source
+if [ ! -d "third_party/pytorch3d" ]; then
+    mkdir -p third_party
+    cd third_party
+    git clone https://github.com/facebookresearch/pytorch3d.git
+    cd pytorch3d
+    git checkout stable
+    cd ../..
+fi
+cd third_party/pytorch3d
+pip install -e . --no-build-isolation
+cd ../..
 
 echo "Adjusting code in sapien/wrapper/urdf_loader.py ..."
 # location of sapien, like "~/.conda/envs/RoboTwin/lib/python3.10/site-packages/sapien"

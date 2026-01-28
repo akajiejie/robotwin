@@ -24,6 +24,7 @@ export HYDRA_FULL_ERROR=1
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 
 # 🔥 启用HuggingFace离线模式 (使用本地缓存的预训练权重)
+# 注释掉离线模式,允许从HuggingFace下载预训练权重
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 

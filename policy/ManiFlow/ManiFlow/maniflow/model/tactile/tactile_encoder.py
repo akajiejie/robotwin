@@ -25,6 +25,7 @@ class TimmTactileEncoder(BaseSensoryEncoder):
         use_group_norm: bool = True,
         share_tactile_model: bool = False,
         feature_dim: int = 768,  # 输出特征维度，对应CLIP cls token
+        output_all_patches: bool = False,  # 🔥 是否输出所有patch tokens（类似ViT）
     ):
         super().__init__()
         
@@ -37,6 +38,9 @@ class TimmTactileEncoder(BaseSensoryEncoder):
                 key_shape_map[key] = tuple(attr['shape'])
         
         tactile_keys = sorted(tactile_keys)
+        
+        # 🔥 提前保存output_all_patches，因为_create_tactile_model需要使用它
+        self.output_all_patches = output_all_patches
         
         # 为每个触觉传感器创建或共享模型
         key_model_map = nn.ModuleDict()
@@ -61,6 +65,10 @@ class TimmTactileEncoder(BaseSensoryEncoder):
         self.key_model_map = key_model_map
         self.key_shape_map = key_shape_map
         self.feature_dim = feature_dim
+        # self.output_all_patches 已在前面赋值
+        
+        print(f"✓ 触觉编码器输出模式: {'all_patches' if output_all_patches else 'aggregated'}", 
+               'cyan' if output_all_patches else 'green')
         
     def _create_tactile_model(self, shape, model_name, pretrained, frozen, use_group_norm, feature_dim):
         """创建单个触觉处理模型"""
@@ -98,12 +106,19 @@ class TimmTactileEncoder(BaseSensoryEncoder):
                 )
             )
         
-        # 添加SpatialSoftmax池化 + 线性投影
-        # ResNet18的layer4输出是512通道
-        spatial_softmax = SpatialSoftmax(temperature=1.0)
-        projection = nn.Linear(512 * 2, feature_dim)  # SpatialSoftmax输出 (x,y) 坐标，所以是 C*2
-        
-        return nn.Sequential(backbone, spatial_softmax, projection)
+        # 🔥 根据output_all_patches决定输出方式
+        if self.output_all_patches:
+            # 输出所有空间patch tokens: (B, C, H, W) -> (B, H*W, D)
+            # ResNet18 layer4输出: 512通道
+            # 添加1x1卷积投影到目标维度，然后reshape为patch tokens
+            conv_proj = nn.Conv2d(512, feature_dim, kernel_size=1)
+            return nn.Sequential(backbone, conv_proj)
+        else:
+            # 原始方式: SpatialSoftmax池化 + 线性投影
+            # ResNet18的layer4输出是512通道
+            spatial_softmax = SpatialSoftmax(temperature=1.0)
+            projection = nn.Linear(512 * 2, feature_dim)  # SpatialSoftmax输出 (x,y) 坐标，所以是 C*2
+            return nn.Sequential(backbone, spatial_softmax, projection)
     
     def modalities(self):
         return ['tactile']
@@ -111,7 +126,9 @@ class TimmTactileEncoder(BaseSensoryEncoder):
     def forward(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         输入: obs字典，每个触觉key对应 (B, T, C, H, W) 或 (B, C, H, W)
-        输出: 每个触觉key对应的token特征 (B, 1, D)，与CLIP cls token格式一致
+        输出: 
+            - output_all_patches=False: 每个触觉key对应的token特征 (B, T, D)，保留时序维度
+            - output_all_patches=True: 每个触觉key对应的patch tokens (B, T*H*W, D)，保留时序维度
         """
         output = {}
         
@@ -145,16 +162,28 @@ class TimmTactileEncoder(BaseSensoryEncoder):
                 )
             
             # 前向传播
-            feature = self.key_model_map[key](tactile_data)  # (B*T, D)
-            feature = feature.reshape(B, T, -1).mean(dim=1)  # 平均时序维度 -> (B, D)
-            feature = feature.unsqueeze(1)  # 添加token维度 -> (B, 1, D)
+            feature = self.key_model_map[key](tactile_data)
+            
+            # 🔥 根据output_all_patches决定输出格式（保留时序维度）
+            if self.output_all_patches:
+                # 输出所有patch tokens: (B*T, D, H, W) -> (B, T*H*W, D)
+                BT, D, H, W = feature.shape
+                feature = feature.flatten(2).transpose(1, 2)  # (B*T, H*W, D)
+                feature = feature.reshape(B, T * H * W, D)  # 保留时序维度 -> (B, T*H*W, D)
+            else:
+                # 原始方式: 聚合为token序列 (B*T, D) -> (B, T, D)
+                feature = feature.reshape(B, T, -1)  # 保留时序维度 -> (B, T, D)
             
             output[key] = feature
         
         return output
     
     def output_feature_dim(self):
-        """返回每个触觉传感器的输出特征维度 (token size: [B, 1, D])"""
+        """
+        返回每个触觉传感器的输出特征维度
+        - output_all_patches=False: [B, T, D] (保留时序维度)
+        - output_all_patches=True: [B, T*H*W, D] (保留时序维度)
+        """
         return {key: self.feature_dim for key in self.tactile_keys}
 
 
@@ -239,8 +268,8 @@ if __name__ == '__main__':
         out = encoder(obs)
     
     print(f"\n输入: [B=4, T=2, C=1, H=16, W=32]")
-    print(f"输出 (token格式): {list(out.values())[0].shape} -> 期望: [B=4, 1, D=768]")
-    assert list(out.values())[0].shape == (4, 1, 768), "输出形状不匹配！"
+    print(f"输出 (保留时序): {list(out.values())[0].shape} -> 期望: [B=4, T=2, D=768]")
+    assert list(out.values())[0].shape == (4, 2, 768), "输出形状不匹配！"
     
     # 测试梯度
     obs_grad = {
@@ -251,10 +280,10 @@ if __name__ == '__main__':
     
     # 验证输出形状
     for key, feat in output.items():
-        assert feat.shape == (2, 1, 768), f"{key} 输出形状错误: {feat.shape}"
+        assert feat.shape == (2, 2, 768), f"{key} 输出形状错误: {feat.shape}"
     
     loss = sum(v.sum() for v in output.values())
     loss.backward()
     
     print(f"梯度范数: {obs_grad['left_tactile'].grad.norm().item():.6f}")
-    print("\n✅ 测试通过 - 输出token格式: [B, 1, 768] 与CLIP cls token一致\n")
+    print("\n✅ 测试通过 - 输出格式: [B, T, 768] 保留完整时序信息\n")

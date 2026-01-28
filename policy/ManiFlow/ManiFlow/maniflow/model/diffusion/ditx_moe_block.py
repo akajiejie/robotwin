@@ -18,11 +18,108 @@ from torch.jit import Final
 from einops.layers.torch import Rearrange
 from timm.models.vision_transformer import Mlp, use_fused_attn
 from maniflow.model.diffusion.ditx_block import DiTXBlock
+from maniflow.model.gate.MoEgate import SparseMoeBlock
 
 logger = logging.getLogger(__name__)
 
+
+FLASH_ATTN_AVAILABLE = False
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+    logger.info("🚀 Flash Attention 2 已启用，训练将显著加速！")
+except ImportError:
+    logger.info("⚠️ Flash Attention 未安装，使用 PyTorch SDPA 后端")
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class FlashSelfAttention(nn.Module):
+    """
+    Self-Attention with Flash Attention 2 support.
+    
+    当 flash-attn 可用时使用 Flash Attention 2，否则回退到 PyTorch SDPA。
+    比 nn.MultiheadAttention 更快，特别是在长序列上。
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        attn_drop: float = 0.,
+        proj_drop: float = 0.,
+        norm_layer: nn.Module = nn.LayerNorm,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # QKV projection
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        
+        self.use_flash_attn = FLASH_ATTN_AVAILABLE
+        
+    def forward(self, x: torch.Tensor, attn_mask=None):
+        """
+        Args:
+            x: Input tensor of shape (B, N, C)
+            attn_mask: Optional attention mask (not supported with Flash Attention)
+        
+        Returns:
+            output: (B, N, C)
+            attn_weights: None (Flash Attention doesn't return weights)
+        """
+        B, N, C = x.shape
+        
+        # QKV projection: (B, N, 3*C) -> (B, N, 3, num_heads, head_dim)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        
+        if self.use_flash_attn and x.is_cuda and x.dtype in [torch.float16, torch.bfloat16]:
+            # 🚀 Flash Attention 2 路径
+            # flash_attn_func 需要 (B, N, num_heads, head_dim) 格式
+            q, k, v = qkv.unbind(2)  # 3 x (B, N, num_heads, head_dim)
+            
+            # QK Normalization
+            q, k = self.q_norm(q), self.k_norm(k)
+            
+            # Flash Attention (自动处理 causal=False)
+            dropout_p = self.attn_drop.p if self.training else 0.
+            out = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=False)
+            # out: (B, N, num_heads, head_dim)
+            
+        else:
+            # PyTorch SDPA 后端（支持 FP32）
+            qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, N, head_dim)
+            q, k, v = qkv.unbind(0)
+            
+            # QK Normalization
+            q, k = self.q_norm(q), self.k_norm(k)
+            
+            # Scaled dot-product attention
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+            # out: (B, num_heads, N, head_dim) -> (B, N, num_heads, head_dim)
+            out = out.transpose(1, 2)
+        
+        # Reshape and project
+        out = out.reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        
+        return out, None  # 返回 None 作为 attn_weights，保持接口兼容
+
 
 class AdaptiveLayerNorm(nn.Module):
     def __init__(
@@ -58,271 +155,17 @@ class AdaptiveLayerNorm(nn.Module):
 
         return x
 
-
-class ModalityMoE(nn.Module):
-    """
-    模态级别MoE：按模态组合进行路由，每个专家只处理特定模态特征
-    
-    🔥 专家专业化策略（每个专家只处理其对应的模态特征）：
-    - Expert 0: 全模态组合 (head + wrist + proprio) - 处理所有tokens
-    - Expert 1: 头部+本体专家 (head + proprio) - 只处理head和proprio的tokens
-    - Expert 2: 腕部+本体专家 (wrist + proprio) - 只处理wrist和proprio的tokens
-    - Expert 3+: 额外专家，默认处理全模态
-    
-    核心改进：
-    - Gate根据模态组合聚合特征选择专家
-    - 专家只处理其对应的模态tokens，保证专业化
-    - 避免无关模态干扰专家学习
-    
-    Args:
-        embed_dim: 特征维度
-        num_experts: 专家数量 (>=3)
-        num_experts_per_tok: 每次激活的专家数
-        n_shared_experts: 共享专家数量
-        aux_loss_alpha: 负载均衡损失权重
-        use_time_cond: 是否使用时间条件调制
-    """
-    def __init__(self, embed_dim, num_experts=4, num_experts_per_tok=2, 
-                 n_shared_experts=1, aux_loss_alpha=0.01, use_time_cond=True,
-                 enable_grad_accumulation=False):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_shared_experts = n_shared_experts
-        self.aux_loss_alpha = aux_loss_alpha
-        self.use_time_cond = use_time_cond
-        self.enable_grad_accumulation = enable_grad_accumulation
-        
-        # 模态级别门控：输入为模态聚合特征
-        # 3个模态组合的聚合特征 -> 专家选择
-        self.gate_proj = nn.Linear(embed_dim * 3, num_experts)  # 3种模态组合
-        
-        # 时间条件调制门控
-        if use_time_cond:
-            self.time_gate_modulation = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(embed_dim, num_experts * 2)  # scale和shift
-            )
-            nn.init.zeros_(self.time_gate_modulation[-1].weight)
-            nn.init.zeros_(self.time_gate_modulation[-1].bias)
-        
-        # 梯度累积支持：累积多个micro-batch的统计信息
-        if enable_grad_accumulation:
-            self.register_buffer('_accumulated_expert_usage', torch.zeros(num_experts))
-            self.register_buffer('_accumulated_router_prob', torch.zeros(num_experts))
-            self.register_buffer('_accumulated_samples', torch.zeros(1))
-        
-        # 专家网络：每个专家处理完整的context_c
-        mlp_hidden = int(embed_dim * 4)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(embed_dim, mlp_hidden),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(mlp_hidden, embed_dim)
-            ) for _ in range(num_experts)
-        ])
-        
-        # 共享专家
-        if n_shared_experts > 0:
-            self.shared_expert = nn.Sequential(
-                nn.Linear(embed_dim, mlp_hidden * n_shared_experts),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(mlp_hidden * n_shared_experts, embed_dim)
-            )
-        else:
-            self.shared_expert = None
-        
-        # 用于记录统计信息
-        self.moe_stats = None
-        
-        self._init_weights()
-    
-    def reset_accumulation(self):
-        """重置累积的统计信息（在optimizer.step()后调用）"""
-        if self.enable_grad_accumulation:
-            self._accumulated_expert_usage.zero_()
-            self._accumulated_router_prob.zero_()
-            self._accumulated_samples.zero_()
-    
-    def _init_weights(self):
-        for expert in self.experts:
-            nn.init.xavier_uniform_(expert[0].weight)
-            nn.init.zeros_(expert[0].bias)
-            nn.init.xavier_uniform_(expert[2].weight)
-            nn.init.zeros_(expert[2].bias)
-        if self.shared_expert is not None:
-            nn.init.xavier_uniform_(self.shared_expert[0].weight)
-            nn.init.zeros_(self.shared_expert[0].bias)
-            nn.init.xavier_uniform_(self.shared_expert[2].weight)
-            nn.init.zeros_(self.shared_expert[2].bias)
-    
-    def forward(self, context_c, time_cond=None, modality_lens=None):
-        """
-        Args:
-            context_c: (B, L_total, D) 多模态特征序列
-            time_cond: (B, D) 时间条件嵌入
-            modality_lens: dict 各模态长度 {'head': L_head, 'wrist': L_wrist, 'proprio': L_proprio}
-                          如果为None，则均分
-        Returns:
-            output: (B, L_total, D) 处理后的特征
-        """
-        B, L, D = context_c.shape
-        
-        # 解析模态长度
-        if modality_lens is None:
-            # 默认均分
-            L_head = L_wrist = L // 3
-            L_proprio = L - L_head - L_wrist
-        else:
-            L_head = modality_lens.get('head', 0)
-            L_wrist = modality_lens.get('wrist', 0)
-            L_proprio = modality_lens.get('proprio', L - L_head - L_wrist)
-        
-        # 分割模态特征
-        head_feat = context_c[:, :L_head, :]  # (B, L_head, D)
-        wrist_feat = context_c[:, L_head:L_head+L_wrist, :]  # (B, L_wrist, D)
-        proprio_feat = context_c[:, L_head+L_wrist:, :]  # (B, L_proprio, D)
-        
-        # 计算模态组合的聚合特征（用于门控）
-        # 组合1: 全模态 (head + wrist + proprio)
-        full_agg = context_c.mean(dim=1)  # (B, D)
-        # 组合2: 头部+本体
-        head_proprio_agg = torch.cat([head_feat, proprio_feat], dim=1).mean(dim=1) if L_head > 0 else proprio_feat.mean(dim=1)
-        # 组合3: 腕部+本体
-        wrist_proprio_agg = torch.cat([wrist_feat, proprio_feat], dim=1).mean(dim=1) if L_wrist > 0 else proprio_feat.mean(dim=1)
-        
-        # 拼接聚合特征用于门控
-        gate_input = torch.cat([full_agg, head_proprio_agg, wrist_proprio_agg], dim=-1)  # (B, 3*D)
-        
-        # 计算门控分数
-        gate_logits = self.gate_proj(gate_input)  # (B, num_experts)
-        
-        # 时间条件调制
-        if self.use_time_cond and time_cond is not None:
-            modulation = self.time_gate_modulation(time_cond)
-            scale, shift = modulation.chunk(2, dim=-1)
-            gate_logits = gate_logits * (1 + scale) + shift
-        
-        gate_scores = F.softmax(gate_logits, dim=-1)  # (B, num_experts)
-        
-        # 选择top-k专家
-        topk_weights, topk_indices = torch.topk(gate_scores, k=self.num_experts_per_tok, dim=-1)
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)  # 归一化
-        
-        # 🆕 专家计算（专家只处理特定模态）
-        output = torch.zeros_like(context_c)
-        for k in range(self.num_experts_per_tok):
-            expert_idx = topk_indices[:, k]  # (B,)
-            expert_weight = topk_weights[:, k:k+1].unsqueeze(-1)  # (B, 1, 1)
-            
-            # 对每个batch样本应用对应专家
-            for b in range(B):
-                idx = expert_idx[b].item()
-                
-                # 🔥 根据专家索引决定处理哪些模态
-                # Expert 0: 全模态 (head + wrist + proprio)
-                # Expert 1: 头部+本体 (head + proprio)
-                # Expert 2: 腕部+本体 (wrist + proprio)
-                # Expert 3+: 默认处理全模态
-                
-                if idx == 0 or idx >= 3:  # 全模态专家
-                    expert_input = context_c[b]  # (L_total, D)
-                    expert_output = self.experts[idx](expert_input)
-                    output[b] += expert_weight[b] * expert_output
-                    
-                elif idx == 1:  # 头部+本体专家
-                    if L_head > 0 and L_proprio > 0:
-                        # 拼接头部和本体特征
-                        expert_input = torch.cat([head_feat[b], proprio_feat[b]], dim=0)  # (L_head+L_proprio, D)
-                        expert_output = self.experts[idx](expert_input)
-                        # 分配回对应位置
-                        output[b, :L_head] += expert_weight[b, 0, 0] * expert_output[:L_head]
-                        output[b, L_head+L_wrist:] += expert_weight[b, 0, 0] * expert_output[L_head:]
-                    elif L_head > 0:  # 只有头部
-                        expert_output = self.experts[idx](head_feat[b])
-                        output[b, :L_head] += expert_weight[b, 0, 0] * expert_output
-                    elif L_proprio > 0:  # 只有本体
-                        expert_output = self.experts[idx](proprio_feat[b])
-                        output[b, L_head+L_wrist:] += expert_weight[b, 0, 0] * expert_output
-                        
-                elif idx == 2:  # 腕部+本体专家
-                    if L_wrist > 0 and L_proprio > 0:
-                        # 拼接腕部和本体特征
-                        expert_input = torch.cat([wrist_feat[b], proprio_feat[b]], dim=0)  # (L_wrist+L_proprio, D)
-                        expert_output = self.experts[idx](expert_input)
-                        # 分配回对应位置
-                        output[b, L_head:L_head+L_wrist] += expert_weight[b, 0, 0] * expert_output[:L_wrist]
-                        output[b, L_head+L_wrist:] += expert_weight[b, 0, 0] * expert_output[L_wrist:]
-                    elif L_wrist > 0:  # 只有腕部
-                        expert_output = self.experts[idx](wrist_feat[b])
-                        output[b, L_head:L_head+L_wrist] += expert_weight[b, 0, 0] * expert_output
-                    elif L_proprio > 0:  # 只有本体
-                        expert_output = self.experts[idx](proprio_feat[b])
-                        output[b, L_head+L_wrist:] += expert_weight[b, 0, 0] * expert_output
-        
-        # 添加共享专家
-        if self.shared_expert is not None:
-            output = output + self.shared_expert(context_c)
-        
-        # 计算负载均衡损失
-        if self.training and self.aux_loss_alpha > 0:
-            if self.enable_grad_accumulation:
-                # 梯度累积模式：累积统计信息
-                with torch.no_grad():
-                    # 累积专家使用频率
-                    expert_mask = F.one_hot(topk_indices.view(-1), num_classes=self.num_experts).float()
-                    expert_usage_batch = expert_mask.sum(0)  # (num_experts,)
-                    self._accumulated_expert_usage += expert_usage_batch
-                    
-                    # 累积路由概率
-                    router_prob_batch = gate_scores.sum(0)  # (num_experts,)
-                    self._accumulated_router_prob += router_prob_batch
-                    
-                    # 累积样本数
-                    num_samples = B * self.num_experts_per_tok
-                    self._accumulated_samples += num_samples
-                
-                # 基于累积统计计算负载均衡损失
-                if self._accumulated_samples > 0:
-                    expert_usage = self._accumulated_expert_usage / self._accumulated_samples.clamp(min=1.0)
-                    router_prob = self._accumulated_router_prob / (self._accumulated_samples.clamp(min=1.0) / self.num_experts_per_tok)
-                    aux_loss = (expert_usage * router_prob).sum() * self.num_experts * self.aux_loss_alpha
-                else:
-                    aux_loss = torch.tensor(0.0, device=context_c.device, dtype=context_c.dtype)
-                    expert_usage = torch.zeros(self.num_experts, device=context_c.device)
-                    router_prob = torch.zeros(self.num_experts, device=context_c.device)
-            else:
-                # 标准模式：每个batch独立计算
-                # 专家使用频率
-                expert_mask = F.one_hot(topk_indices.view(-1), num_classes=self.num_experts).float()
-                expert_usage = expert_mask.mean(0)
-                # 路由概率
-                router_prob = gate_scores.mean(0)
-                # 负载均衡损失
-                aux_loss = (expert_usage * router_prob).sum() * self.num_experts * self.aux_loss_alpha
-            
-            # 计算topk_weights统计 (处理batch_size=1的情况)
-            topk_mean = topk_weights.mean().detach().item()
-            # 只有当有多个样本时才计算std，否则设为0
-            if topk_weights.numel() > 1:
-                topk_std = topk_weights.std().detach().item()
-            else:
-                topk_std = 0.0
-            
-            self.moe_stats = {
-                'aux_loss': aux_loss.detach().item(),
-                'expert_usage': expert_usage.detach(),
-                'router_scores': router_prob.detach(),
-                'topk_weights_mean': topk_mean,
-                'topk_weights_std': topk_std,
-            }
-        
-        return output
-
 class CrossAttention(nn.Module):
     """
-    A cross-attention layer with flash attention.
+    Cross-attention layer with flash attention and optional gate mechanism.
+    
+    支持两种门控模式（参考Qwen3的gated attention）：
+    - 'none': 无门控（标准cross-attention）
+    - 'headwise': 每个注意力头一个gate值（轻量级）
+    - 'elementwise': 每个元素一个gate值（最细粒度，参考Qwen3）
+    
+    Args:
+        gate_type: 门控类型 ('none', 'headwise', 'elementwise')
     """
     fused_attn: Final[bool]
     def __init__(
@@ -334,6 +177,7 @@ class CrossAttention(nn.Module):
             attn_drop: float = 0,
             proj_drop: float = 0,
             norm_layer: nn.Module = nn.LayerNorm,
+            gate_type: str = 'none',  # 🔥 新增：gate-attention类型
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -341,72 +185,148 @@ class CrossAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
+        self.use_flash_attn = FLASH_ATTN_AVAILABLE
+        self.gate_type = gate_type
 
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        # 🔥 Query projection with optional gate（参考Qwen3）
+        if gate_type == 'headwise':
+            # 每个头一个gate: q_dim + num_heads
+            self.q = nn.Linear(dim, dim + num_heads, bias=qkv_bias)
+        elif gate_type == 'elementwise':
+            # 每个元素一个gate: q_dim * 2（与Qwen3一致）
+            self.q = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        else:
+            # 标准query
+            self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        
+        if gate_type != 'none':
+            logger.info(f"[CrossAttention] 🔥 启用Gate-Attention机制: {gate_type}（参考Qwen3）")
     
     def forward(self, x: torch.Tensor, c: torch.Tensor, 
                 mask: None) -> torch.Tensor:
         B, N, C = x.shape
         _, L, _ = c.shape
-        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        kv = self.kv(c).reshape(B, L, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
-
-        # Prepare attn mask (B, L) to mask the conditioion
-        if mask is not None:
-            mask = mask.reshape(B, 1, 1, L)
-            mask = mask.expand(-1, -1, N, -1)
         
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                query=q,
-                key=k,
-                value=v,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-                attn_mask=mask
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            if mask is not None:
-                attn = attn.masked_fill_(mask.logical_not(), float('-inf'))
-            attn = attn.softmax(dim=-1)
-            if self.attn_drop.p > 0:
-                attn = self.attn_drop(attn)
-            x = attn @ v
+        # 🔥 Query projection with gate extraction（参考Qwen3实现）
+        q_output = self.q(x)
+        
+        if self.gate_type == 'headwise':
+            # Headwise gate: 每个头一个gate值
+            # q_output: (B, N, dim + num_heads)
+            q_output = q_output.view(B, N, self.num_heads, -1)
+            q, gate_score = torch.split(q_output, [self.head_dim, 1], dim=-1)
+            # gate_score: (B, N, num_heads, 1)
+            q = q.permute(0, 2, 1, 3)  # (B, num_heads, N, head_dim)
             
-        x = x.permute(0, 2, 1, 3).reshape(B, N, C)
-        x = self.proj(x)
+        elif self.gate_type == 'elementwise':
+            # Elementwise gate: 每个元素一个gate值（与Qwen3一致）
+            # q_output: (B, N, dim * 2)
+            q_output = q_output.view(B, N, self.num_heads, -1)
+            q, gate_score = torch.split(q_output, [self.head_dim, self.head_dim], dim=-1)
+            # gate_score: (B, N, num_heads, head_dim)
+            q = q.permute(0, 2, 1, 3)  # (B, num_heads, N, head_dim)
+            
+        else:
+            # 标准模式：无gate
+            q = q_output.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            gate_score = None
+        
+        # Key-Value projection
+        kv = self.kv(c).reshape(B, L, 2, self.num_heads, self.head_dim)
+        k, v = kv.unbind(2)  # k, v: (B, L, num_heads, head_dim)
+        
+        # 🚀 Flash Attention 路径
+        if self.use_flash_attn and x.is_cuda and x.dtype in [torch.float16, torch.bfloat16] and mask is None:
+            # Flash Attention 需要 (B, N, num_heads, head_dim) 格式
+            # q 当前是 (B, num_heads, N, head_dim)，需要转换
+            q = q.transpose(1, 2)  # (B, N, num_heads, head_dim)
+            
+            # QK Normalization
+            q, k = self.q_norm(q), self.k_norm(k)
+            
+            # Flash Attention cross-attention
+            dropout_p = self.attn_drop.p if self.training else 0.
+            attn_output = flash_attn_func(q, k, v, dropout_p=dropout_p, causal=False)
+            # attn_output: (B, N, num_heads, head_dim)
+            
+        else:
+            # PyTorch SDPA 后端
+            # 转换 k, v 到 (B, num_heads, L, head_dim)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+            
+            # QK Normalization
+            q, k = self.q_norm(q), self.k_norm(k)
+
+            # Prepare attn mask (B, L) to mask the condition
+            if mask is not None:
+                mask = mask.reshape(B, 1, 1, L)
+                mask = mask.expand(-1, -1, N, -1)
+            
+            # Attention computation
+            if self.fused_attn:
+                attn_output = F.scaled_dot_product_attention(
+                    query=q,
+                    key=k,
+                    value=v,
+                    dropout_p=self.attn_drop.p if self.training else 0.,
+                    attn_mask=mask
+                )
+            else:
+                q = q * self.scale
+                attn = q @ k.transpose(-2, -1)
+                if mask is not None:
+                    attn = attn.masked_fill_(mask.logical_not(), float('-inf'))
+                attn = attn.softmax(dim=-1)
+                if self.attn_drop.p > 0:
+                    attn = self.attn_drop(attn)
+                attn_output = attn @ v
+            
+            # attn_output: (B, num_heads, N, head_dim) -> (B, N, num_heads, head_dim)
+            attn_output = attn_output.transpose(1, 2)
+        
+        # 🔥 Gate-Attention: 用sigmoid(gate)调制attention输出（参考Qwen3）
+        if gate_score is not None:
+            attn_output = attn_output * torch.sigmoid(gate_score)
+        
+        # Reshape and project
+        attn_output = attn_output.reshape(B, N, C)
+        attn_output = self.proj(attn_output)
         if self.proj_drop.p > 0:
-            x = self.proj_drop(x)
-        return x
+            attn_output = self.proj_drop(attn_output)
+        
+        return attn_output
 
 
 class DiTXMoEBlock(nn.Module):
     """
-    DiTX Block with Modality-level Mixture of Experts (MoE).
+    DiTX Block with Token-level Mixture of Experts (MoE) and Gate-Attention.
     
     核心改进：
-    1. 模态级别路由：按模态组合（全模态/头部+本体/腕部+本体）进行路由，保持模态内语义一致性
+    1. Token级别路由：每个token独立选择专家，细粒度的特征处理
     2. 时间条件感知：MoE门控感知扩散时间步，根据噪声阶段调整专家选择
-    3. AdaLN协调：context_c在进入MoE前通过AdaLN感知时间条件
+    3. 专家自动学习：在不同时间步下关注不同模态的token特征
+    4. AdaLN协调：context_c在进入MoE前通过AdaLN感知时间条件
+    5. Gate-Attention：Cross-attention输出通过可学习的gate调制（参考Qwen3）
     
     Args:
         hidden_size: 隐藏层维度
         num_heads: 注意力头数
         mlp_ratio: MLP扩展比例
-        use_modality_moe: 是否使用模态MoE
+        use_token_moe: 是否使用token级MoE
         num_experts: MoE专家数量
         num_experts_per_tok: 每个token激活的专家数
         n_shared_experts: 共享专家数量
         moe_aux_loss_alpha: MoE辅助损失权重
+        enable_grad_accumulation: 是否启用梯度累积友好模式
+        gate_type: Gate-Attention类型 ('none', 'headwise', 'elementwise')
         p_drop_attn: Attention dropout概率
         qkv_bias: 是否使用QKV bias
         qk_norm: 是否对Q和K进行归一化
@@ -417,12 +337,15 @@ class DiTXMoEBlock(nn.Module):
                 mlp_ratio=4.0,
                 
                 # MoE配置
-                use_modality_moe=True,
-                num_experts=4,                # 模态级MoE建议4-8个专家
+                use_token_moe=True,           # 🔥 改名：强调token级别
+                num_experts=8,                # Token级MoE建议8-16个专家（比模态级更多）
                 num_experts_per_tok=2,
                 n_shared_experts=1,
                 moe_aux_loss_alpha=0.01,
                 enable_grad_accumulation=False,  # 🔥 梯度累积支持
+                
+                # Gate-Attention配置
+                gate_type='elementwise',      # 🔥 'none', 'headwise', 'elementwise'
                 
                 # 其他参数
                 p_drop_attn=0.1,
@@ -432,40 +355,46 @@ class DiTXMoEBlock(nn.Module):
         super().__init__()
         
         self.hidden_size = hidden_size
-        self.use_modality_moe = use_modality_moe
+        self.use_token_moe = use_token_moe
         self.enable_grad_accumulation = enable_grad_accumulation
 
-        # Self-Attention
-        self.self_attn = nn.MultiheadAttention(
-            hidden_size, num_heads, 
-            batch_first=True, 
-            dropout=p_drop_attn
+        # 🚀 Self-Attention with Flash Attention support
+        self.self_attn = FlashSelfAttention(
+            dim=hidden_size,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_drop=p_drop_attn,
+            proj_drop=0.,
+            norm_layer=nn.LayerNorm,
         )
         
-        # ⭐ 模态级别MoE (替代token级别的SparseMoeBlock)
-        if use_modality_moe:
-            self.modality_moe = ModalityMoE(
+        # ⭐ Token级别MoE：每个token独立路由，专家自动学习特征模式
+        if use_token_moe:
+            self.token_moe = SparseMoeBlock(
                 embed_dim=hidden_size,
+                mlp_ratio=mlp_ratio,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 n_shared_experts=n_shared_experts,
                 aux_loss_alpha=moe_aux_loss_alpha,
-                use_time_cond=True,  # 启用时间条件感知
-                enable_grad_accumulation=enable_grad_accumulation  # 🔥 传递梯度累积配置
+                use_time_cond=True,  # 🔥 启用时间条件感知
+                enable_grad_accumulation=enable_grad_accumulation
             )
             # context_c的AdaLN：让MoE输入感知时间条件
             self.context_adaln = AdaptiveLayerNorm(dim=hidden_size, dim_cond=hidden_size)
-            logger.info(f"[DiTXMoEBlock] Initialized ModalityMoE with {num_experts} experts, "
+            logger.info(f"[DiTXMoEBlock] 🔥 Initialized Token-level MoE with {num_experts} experts, "
                        f"top-{num_experts_per_tok}, {n_shared_experts} shared, time_cond=True, "
                        f"grad_accum={enable_grad_accumulation}")
         
-        # Cross-Attention
+        # Cross-Attention with Gate-Attention
         self.cross_attn = CrossAttention(
             dim=hidden_size, 
             num_heads=num_heads,
             qkv_bias=qkv_bias, 
             qk_norm=qk_norm,
-            norm_layer=nn.LayerNorm, 
+            norm_layer=nn.LayerNorm,
+            gate_type=gate_type,  # 🔥 传递gate-attention配置
             **block_kwargs
         )
        
@@ -493,8 +422,14 @@ class DiTXMoEBlock(nn.Module):
     
     def reset_moe_accumulation(self):
         """重置MoE的累积统计（在optimizer.step()后调用）"""
-        if self.use_modality_moe and self.enable_grad_accumulation:
-            self.modality_moe.reset_accumulation()
+        if self.use_token_moe and self.enable_grad_accumulation:
+            self.token_moe.reset_gate_accumulation()
+    
+    def get_moe_stats(self):
+        """获取MoE统计信息（用于wandb记录）"""
+        if self.use_token_moe and hasattr(self.token_moe, 'moe_stats'):
+            return self.token_moe.moe_stats
+        return None
         
     def forward(self, x, time_c, context_c, attn_mask=None, modality_lens=None):
         """
@@ -504,8 +439,9 @@ class DiTXMoEBlock(nn.Module):
             x: 动作序列 (batch_size, seq_length, hidden_size)
             time_c: 时间步嵌入 (batch_size, hidden_size)
             context_c: 多模态特征 (batch_size, L_total, hidden_size)
+                      包含所有模态的token: [head_tokens, wrist_tokens, tactile_tokens, proprio_tokens]
             attn_mask: 可选的注意力mask
-            modality_lens: 模态长度信息 {'head': L_head, 'wrist': L_wrist, 'proprio': L_proprio}
+            modality_lens: 模态长度信息（保留接口兼容性，但token级MoE不需要）
         
         Returns:
             x: 输出特征 (batch_size, seq_length, hidden_size)
@@ -518,17 +454,19 @@ class DiTXMoEBlock(nn.Module):
         shift_cross, scale_cross, gate_cross = chunks[3], chunks[4], chunks[5]
         shift_mlp, scale_mlp, gate_mlp = chunks[6], chunks[7], chunks[8]
 
-        # 1. Self-Attention with adaLN conditioning
+        # 1. Self-Attention with adaLN conditioning (🚀 Flash Attention)
         normed_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        self_attn_output, _ = self.self_attn(normed_x, normed_x, normed_x, attn_mask=attn_mask)
+        self_attn_output, _ = self.self_attn(normed_x, attn_mask=attn_mask)
         x = x + gate_msa.unsqueeze(1) * self_attn_output
 
-        # 2. ⭐ 模态MoE处理多模态输入特征
-        if self.use_modality_moe:
+        # 2. ⭐ Token级别MoE处理多模态输入特征
+        # 每个token独立路由，专家自动学习在不同时间步下关注什么特征
+        if self.use_token_moe:
             # 先通过AdaLN让context_c感知时间条件
             context_c_normed = self.context_adaln(context_c, time_c)
-            # 模态级别MoE处理（传入时间条件和模态长度）
-            context_c_processed = self.modality_moe(context_c_normed, time_c, modality_lens)
+            # Token级别MoE处理：(B, L_total, D) -> (B, L_total, D)
+            # 每个token独立选择专家，门控由时间条件调制
+            context_c_processed = self.token_moe(context_c_normed, time_c)
         else:
             context_c_processed = context_c
 
@@ -553,7 +491,7 @@ if __name__ == "__main__":
     def test_ditx_moe_block():
         """测试DiTXMoEBlock的基本功能"""
         print("=" * 80)
-        print("测试 DiTXMoEBlock (模态级别MoE + 时间条件感知)")
+        print("测试 DiTXMoEBlock (Token级别MoE + 时间条件感知)")
         print("=" * 80)
         
         # 参数设置
@@ -562,25 +500,31 @@ if __name__ == "__main__":
         hidden_size = 768
         num_heads = 12
         
-        # 多模态特征长度
-        L_head = 256          # 头部相机特征长度
-        L_wrist = 256         # 腕部相机+触觉特征长度
-        L_proprio = 16        # 本体感知特征长度
-        L_total = L_head + L_wrist + L_proprio
+        # 多模态特征长度（真实场景：1180 tokens）
+        L_head = 392          # 头部相机: 1相机 × 2T × 196patches
+        L_wrist = 784         # 腕部相机: 2相机 × 2T × 196patches  
+        L_tactile = 2         # 触觉传感器: 2传感器 × 1patch
+        L_proprio = 2         # 本体感知: 2时间步
+        L_total = L_head + L_wrist + L_tactile + L_proprio  # 1180 tokens
         
-        # 模态长度信息
-        modality_lens = {'head': L_head, 'wrist': L_wrist, 'proprio': L_proprio}
+        # 模态长度信息（保留接口兼容性）
+        modality_lens = {
+            'head': L_head, 
+            'wrist': L_wrist + L_tactile,  # 腕部视觉+触觉
+            'proprio': L_proprio
+        }
         
-        # 创建DiTXMoEBlock
+        # 创建DiTXMoEBlock (Token级MoE + Gate-Attention)
         block_moe = DiTXMoEBlock(
             hidden_size=hidden_size,
             num_heads=num_heads,
             mlp_ratio=4.0,
-            use_modality_moe=True,
-            num_experts=4,        # 模态级MoE建议4个专家
+            use_token_moe=True,
+            num_experts=8,        # 🔥 Token级MoE建议更多专家
             num_experts_per_tok=2,
             n_shared_experts=1,
             moe_aux_loss_alpha=0.01,
+            gate_type='headwise',  # 🔥 Gate-Attention（参考Qwen3）
             p_drop_attn=0.1
         )
         
@@ -603,20 +547,23 @@ if __name__ == "__main__":
         print(f"  context_c (多模态): {context_c.shape}")
         print(f"    └─ 头部: {L_head}, 腕部: {L_wrist}, 本体: {L_proprio}")
         
-        # 前向传播 - MoE版本（带模态长度信息）
+        # 前向传播 - Token级MoE + Gate-Attention版本
         print(f"\n" + "─" * 80)
-        print("DiTXMoEBlock 前向传播 (模态级别路由)...")
+        print("DiTXMoEBlock 前向传播 (Token级别路由 + Gate-Attention)...")
+        print(f"  🔥 每个token独立选择专家，专家自动学习在不同时间步下关注什么特征")
+        print(f"  🔥 Gate-Attention调制cross-attention输出（参考Qwen3）")
         block_moe.train()
         output_moe = block_moe(x, time_c, context_c, modality_lens=modality_lens)
         print(f"  输出形状: {output_moe.shape}")
         
         # 检查MoE统计信息
-        if hasattr(block_moe, 'modality_moe') and block_moe.modality_moe.moe_stats:
-            stats = block_moe.modality_moe.moe_stats
+        moe_stats = block_moe.get_moe_stats()
+        if moe_stats:
             print(f"  MoE统计:")
-            print(f"    - aux_loss: {stats['aux_loss']:.6f}")
-            print(f"    - expert_usage: {stats['expert_usage'].tolist()}")
-            print(f"    - topk_weights_mean: {stats['topk_weights_mean']:.4f}")
+            print(f"    - aux_loss: {moe_stats['aux_loss']:.6f}")
+            print(f"    - expert_usage: {moe_stats['expert_usage'].cpu().numpy()}")
+            print(f"    - topk_weights_mean: {moe_stats['topk_weights_mean']:.4f}")
+            print(f"    - topk_weights_std: {moe_stats['topk_weights_std']:.4f}")
         print(f"  ✅ 成功!")
         
         # 前向传播 - 原始版本
@@ -640,13 +587,22 @@ if __name__ == "__main__":
         print(f"  增加:          {params_diff:,} 参数 (+{params_diff/params_vanilla*100:.1f}%)")
         
         # 检查MoE模块
-        if hasattr(block_moe, 'modality_moe'):
-            moe_params = sum(p.numel() for p in block_moe.modality_moe.parameters())
-            print(f"\n  ModalityMoE参数: {moe_params:,}")
-            print(f"    ├─ 专家数量: {block_moe.modality_moe.num_experts}")
-            print(f"    ├─ Top-K: {block_moe.modality_moe.num_experts_per_tok}")
-            print(f"    ├─ 共享专家: {block_moe.modality_moe.n_shared_experts}")
-            print(f"    └─ 时间条件: {block_moe.modality_moe.use_time_cond}")
+        if hasattr(block_moe, 'token_moe'):
+            moe_params = sum(p.numel() for p in block_moe.token_moe.parameters())
+            print(f"\n  Token-level MoE参数: {moe_params:,}")
+            print(f"    ├─ 专家数量: {block_moe.token_moe.num_experts}")
+            print(f"    ├─ Top-K: {block_moe.token_moe.num_experts_per_tok}")
+            print(f"    ├─ 共享专家: {block_moe.token_moe.n_shared_experts}")
+            print(f"    ├─ 时间条件: {block_moe.token_moe.use_time_cond}")
+            print(f"    └─ 梯度累积: {block_moe.token_moe.enable_grad_accumulation}")
+        
+        # 检查Gate-Attention
+        if hasattr(block_moe, 'cross_attn'):
+            cross_attn_params = sum(p.numel() for p in block_moe.cross_attn.parameters())
+            print(f"\n  Cross-Attention参数: {cross_attn_params:,}")
+            print(f"    ├─ 注意力头数: {block_moe.cross_attn.num_heads}")
+            print(f"    ├─ Head维度: {block_moe.cross_attn.head_dim}")
+            print(f"    └─ Gate类型: {block_moe.cross_attn.gate_type} 🔥")
         
         print(f"\n" + "=" * 80)
         print("✅ 所有测试通过!")
@@ -656,14 +612,14 @@ if __name__ == "__main__":
     def test_batch_sizes():
         """测试不同batch size"""
         print("\n\n" + "=" * 80)
-        print("测试不同Batch Size")
+        print("测试不同Batch Size (Token级MoE)")
         print("=" * 80)
         
         block = DiTXMoEBlock(
             hidden_size=512,
             num_heads=8,
-            use_modality_moe=True,
-            num_experts=4,
+            use_token_moe=True,
+            num_experts=8,
             num_experts_per_tok=2
         )
         block.eval()
@@ -686,13 +642,13 @@ if __name__ == "__main__":
     def test_without_moe():
         """测试关闭MoE的情况"""
         print("\n\n" + "=" * 80)
-        print("测试关闭MoE (use_modality_moe=False)")
+        print("测试关闭MoE (use_token_moe=False)")
         print("=" * 80)
         
         block = DiTXMoEBlock(
             hidden_size=512,
             num_heads=8,
-            use_modality_moe=False
+            use_token_moe=False
         )
         
         x = torch.randn(2, 32, 512)
@@ -706,17 +662,18 @@ if __name__ == "__main__":
     
     
     def test_gradient_flow():
-        """测试梯度流动"""
+        """测试梯度流动和MoE辅助损失"""
         print("\n\n" + "=" * 80)
-        print("测试梯度流动")
+        print("测试梯度流动和MoE辅助损失")
         print("=" * 80)
         
         block = DiTXMoEBlock(
             hidden_size=512,
             num_heads=8,
-            use_modality_moe=True,
-            num_experts=4,
-            num_experts_per_tok=2
+            use_token_moe=True,
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_aux_loss_alpha=0.01
         )
         block.train()
         
@@ -726,6 +683,11 @@ if __name__ == "__main__":
         
         modality_lens = {'head': 128, 'wrist': 112, 'proprio': 16}
         output = block(x, time_c, context_c, modality_lens=modality_lens)
+        
+        # 检查MoE统计
+        moe_stats = block.get_moe_stats()
+        print(f"  MoE aux_loss: {moe_stats['aux_loss'] if moe_stats else 0.0:.6f}")
+        
         loss = output.sum()
         loss.backward()
         
