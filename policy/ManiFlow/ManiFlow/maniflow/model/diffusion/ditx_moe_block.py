@@ -294,7 +294,27 @@ class CrossAttention(nn.Module):
         
         # 🔥 Gate-Attention: 用sigmoid(gate)调制attention输出（参考Qwen3）
         if gate_score is not None:
-            attn_output = attn_output * torch.sigmoid(gate_score)
+            gate_activation = torch.sigmoid(gate_score)
+            attn_output = attn_output * gate_activation
+            
+            # 收集Gate-Attention激活统计（用于wandb监控）
+            if self.training:
+                with torch.no_grad():
+                    # 计算激活值的均值和标准差
+                    gate_mean = gate_activation.mean().item()
+                    gate_std = gate_activation.std().item()
+                    gate_min = gate_activation.min().item()
+                    gate_max = gate_activation.max().item()
+                    
+                    # 存储统计信息（在block的get_moe_stats中访问）
+                    if not hasattr(self, '_gate_stats_buffer'):
+                        self._gate_stats_buffer = []
+                    self._gate_stats_buffer.append({
+                        'mean': gate_mean,
+                        'std': gate_std,
+                        'min': gate_min,
+                        'max': gate_max,
+                    })
         
         # Reshape and project
         attn_output = attn_output.reshape(B, N, C)
@@ -311,10 +331,9 @@ class DiTXMoEBlock(nn.Module):
     
     核心改进：
     1. Token级别路由：每个token独立选择专家，细粒度的特征处理
-    2. 时间条件感知：MoE门控感知扩散时间步，根据噪声阶段调整专家选择
-    3. 专家自动学习：在不同时间步下关注不同模态的token特征
-    4. AdaLN协调：context_c在进入MoE前通过AdaLN感知时间条件
-    5. Gate-Attention：Cross-attention输出通过可学习的gate调制（参考Qwen3）
+    2. 专家自动学习：自动学习不同模态token的特征处理
+    3. AdaLN协调：context_c在进入MoE前通过AdaLN感知时间条件
+    4. Gate-Attention：Cross-attention输出通过可学习的gate调制（参考Qwen3）
     
     Args:
         hidden_size: 隐藏层维度
@@ -378,13 +397,12 @@ class DiTXMoEBlock(nn.Module):
                 num_experts_per_tok=num_experts_per_tok,
                 n_shared_experts=n_shared_experts,
                 aux_loss_alpha=moe_aux_loss_alpha,
-                use_time_cond=True,  # 🔥 启用时间条件感知
                 enable_grad_accumulation=enable_grad_accumulation
             )
             # context_c的AdaLN：让MoE输入感知时间条件
             self.context_adaln = AdaptiveLayerNorm(dim=hidden_size, dim_cond=hidden_size)
             logger.info(f"[DiTXMoEBlock] 🔥 Initialized Token-level MoE with {num_experts} experts, "
-                       f"top-{num_experts_per_tok}, {n_shared_experts} shared, time_cond=True, "
+                       f"top-{num_experts_per_tok}, {n_shared_experts} shared, "
                        f"grad_accum={enable_grad_accumulation}")
         
         # Cross-Attention with Gate-Attention
@@ -427,9 +445,41 @@ class DiTXMoEBlock(nn.Module):
     
     def get_moe_stats(self):
         """获取MoE统计信息（用于wandb记录）"""
-        if self.use_token_moe and hasattr(self.token_moe, 'moe_stats'):
-            return self.token_moe.moe_stats
-        return None
+        stats = {}
+        
+        if self.use_token_moe and hasattr(self.token_moe, 'moe_stats') and self.token_moe.moe_stats:
+            moe_stats = self.token_moe.moe_stats
+            
+            # 1. MoE专家负载（Expert Load）
+            if 'expert_usage' in moe_stats:
+                expert_usage = moe_stats['expert_usage']
+                # 计算熵值（Entropy）- 衡量专家使用的均匀程度
+                # 熵值越高，专家使用越均匀；熵值过低说明出现"专家坍缩"
+                eps = 1e-10
+                expert_usage_normalized = expert_usage / (expert_usage.sum() + eps)
+                entropy = -(expert_usage_normalized * torch.log(expert_usage_normalized + eps)).sum()
+                max_entropy = torch.log(torch.tensor(len(expert_usage), dtype=torch.float32))
+                normalized_entropy = entropy / max_entropy  # 归一化到[0,1]
+                
+                stats['expert_usage'] = expert_usage
+                stats['expert_entropy'] = entropy.item()
+                stats['expert_entropy_normalized'] = normalized_entropy.item()
+            
+            # 2. 路由分数和辅助损失
+            if 'router_scores' in moe_stats:
+                stats['router_scores'] = moe_stats['router_scores']
+            if 'aux_loss' in moe_stats:
+                stats['aux_loss'] = moe_stats['aux_loss']
+            if 'topk_weights_mean' in moe_stats:
+                stats['topk_weights_mean'] = moe_stats['topk_weights_mean']
+            if 'topk_weights_std' in moe_stats:
+                stats['topk_weights_std'] = moe_stats['topk_weights_std']
+        
+        # 3. Gate-Attention激活分布（需要在forward中收集）
+        if hasattr(self, '_gate_activation_stats'):
+            stats.update(self._gate_activation_stats)
+        
+        return stats if stats else None
         
     def forward(self, x, time_c, context_c, attn_mask=None, modality_lens=None):
         """
@@ -465,8 +515,8 @@ class DiTXMoEBlock(nn.Module):
             # 先通过AdaLN让context_c感知时间条件
             context_c_normed = self.context_adaln(context_c, time_c)
             # Token级别MoE处理：(B, L_total, D) -> (B, L_total, D)
-            # 每个token独立选择专家，门控由时间条件调制
-            context_c_processed = self.token_moe(context_c_normed, time_c)
+            # 每个token独立选择专家
+            context_c_processed = self.token_moe(context_c_normed)
         else:
             context_c_processed = context_c
 
@@ -474,6 +524,18 @@ class DiTXMoEBlock(nn.Module):
         normed_x_cross = modulate(self.norm2(x), shift_cross, scale_cross)
         cross_attn_output = self.cross_attn(normed_x_cross, context_c_processed, mask=None)
         x = x + gate_cross.unsqueeze(1) * cross_attn_output
+        
+        # 收集Gate-Attention统计信息
+        if self.training and hasattr(self.cross_attn, '_gate_stats_buffer') and len(self.cross_attn._gate_stats_buffer) > 0:
+            gate_stats = self.cross_attn._gate_stats_buffer[-1]
+            self._gate_activation_stats = {
+                'gate_activation_mean': gate_stats['mean'],
+                'gate_activation_std': gate_stats['std'],
+                'gate_activation_min': gate_stats['min'],
+                'gate_activation_max': gate_stats['max'],
+            }
+            # 清空buffer
+            self.cross_attn._gate_stats_buffer.clear()
 
         # 4. MLP with adaLN conditioning
         normed_x_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)
@@ -593,7 +655,6 @@ if __name__ == "__main__":
             print(f"    ├─ 专家数量: {block_moe.token_moe.num_experts}")
             print(f"    ├─ Top-K: {block_moe.token_moe.num_experts_per_tok}")
             print(f"    ├─ 共享专家: {block_moe.token_moe.n_shared_experts}")
-            print(f"    ├─ 时间条件: {block_moe.token_moe.use_time_cond}")
             print(f"    └─ 梯度累积: {block_moe.token_moe.enable_grad_accumulation}")
         
         # 检查Gate-Attention

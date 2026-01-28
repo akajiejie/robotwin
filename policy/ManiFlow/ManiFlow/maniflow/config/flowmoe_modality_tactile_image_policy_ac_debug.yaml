@@ -1,0 +1,202 @@
+defaults:
+  - task: demo_task_tactile
+
+# 🔥🔥🔥 专家分化加速配置 - 紧急修复版本
+# 针对 expert_entropy_normalized=0.95 不下降的问题
+
+name: train_maniflow_modality_moe_tactile_image_timm_policy_accelerate
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "debug_expert_divergence"
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 16
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: true
+
+policy:
+  _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
+  block_type: "DiTXMoE"
+  
+  # 🔥 简化架构：降低学习难度
+  n_layer: 8        # 🔥 从12降到8层
+  n_head: 8
+  n_emb: 768
+  
+  visual_cond_len: 12
+  max_lang_cond_len: 1024
+  qkv_bias: true
+  qk_norm: true
+  language_conditioned: false
+  pre_norm_modality: false
+
+  # 🔥🔥🔥 核心修复：极端强化MoE学习
+  use_token_moe: true
+  num_experts: 3              # 🔥 降到3个专家（最小化搜索空间）
+  num_experts_per_tok: 2
+  n_shared_experts: 0         # 🔥 移除共享专家（强制路由学习）
+  moe_aux_loss_alpha: 1.0     # 🔥 极端提高到1.0（aux_loss = 主loss）
+  enable_grad_accumulation: false
+  gate_type: 'none'           # 🔥 先禁用gate-attention（减少复杂度）
+  
+  use_modality_embedding: true
+  head_cond_len: 2
+  wrist_cond_len: 8
+
+  flow_batch_ratio: 0.75 
+  consistency_batch_ratio: 0.25
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete" 
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  obs_encoder:
+    _target_: maniflow.model.vision_2d.timm_multimodal_encoder.TimmMultimodalEncoder
+    shape_meta: ${shape_meta}
+    
+    # 🔥🔥🔥 冻结所有编码器
+    model_name: 'vit_base_patch16_siglip_224'
+    pretrained: true
+    frozen: true              # 🔥 冻结RGB
+    global_pool: ''
+    feature_aggregation: 'avg'
+    downsample_ratio: 32
+    
+    tactile_model_name: 'resnet18'
+    tactile_pretrained: false
+    tactile_frozen: true      # 🔥 也冻结触觉（如果没预训练就随机固定）
+    tactile_feature_dim: 768
+    share_tactile_model: true
+    tactile_output_all_patches: true
+    output_token_sequence: true
+    
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees: [-5.0, 5.0]
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+     
+    use_group_norm: false
+    share_rgb_model: false
+    imagenet_norm: true
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 16          # 🔥 降低batch_size增加更新频率
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 16
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-4              # 🔥 提高学习率到5e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8 
+  weight_decay: 1.0e-3
+
+training:
+  device: "cuda:0"
+  env_device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False           # 🔥 从头开始训练
+  lr_scheduler: cosine
+  lr_warmup_steps: 500    # 🔥 减少warmup（快速达到高学习率）
+  num_epochs: 201
+  
+  use_accelerate: true
+  gradient_accumulate_every: 1
+  mixed_precision: "no"
+  use_wandb: true
+  
+  max_grad_norm: 5.0      # 🔥 降低裁剪阈值（更激进的梯度）
+  
+  use_ema: True  
+  rollout_every: 100
+  checkpoint_every: 100
+  val_every: 50
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${training.seed}
+  project: ManiFlow_DEBUG_Expert_Divergence
+  resume: false
+  tags:
+  - ${logging.project}
+  - emergency_fix
+  - expert_divergence
+  - aux_loss_1.0
+  - 3experts
+  - frozen_all_encoders
+  - accelerate
+
+checkpoint:
+  save_ckpt: True
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 1
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  
+  save_last_ckpt: True
+  save_last_snapshot: False
+  save_every: 50
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+checkpoint_num: 500
+expert_data_num: 50
+raw_task_name: none
+setting: none
+

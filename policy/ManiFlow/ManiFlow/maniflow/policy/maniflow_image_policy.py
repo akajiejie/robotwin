@@ -605,68 +605,69 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 'bc_loss': loss.item(),
         }
         
-        # 收集 MoE 统计信息
         if hasattr(self.model, 'blocks') and self.training:
             moe_aux_losses = []
             expert_usages = []
-            router_scores_list = []
-            topk_weights_means = []
+            expert_entropies_normalized = []  # 🔥 专家熵值（核心指标1）
+            gate_activation_means = []  # 🔥 Gate激活均值（核心指标2）
+            gate_activation_stds = []  # 🔥 Gate激活标准差
             
             for i, block in enumerate(self.model.blocks):
                 # 🔥 使用统一的get_moe_stats()方法获取MoE统计信息
-                # 支持Token级MoE（DiTXMoEBlock）
                 moe_stats = None
                 if hasattr(block, 'get_moe_stats'):
                     moe_stats = block.get_moe_stats()
                 
                 if moe_stats:
-                        # 记录辅助损失
+                        # 收集辅助损失
                         if 'aux_loss' in moe_stats:
                             moe_aux_losses.append(moe_stats['aux_loss'])
-                            loss_dict[f'moe/block_{i}/aux_loss'] = moe_stats['aux_loss']
                         
-                        # 记录专家使用率
+                        # 收集专家使用率
                         if 'expert_usage' in moe_stats:
-                            expert_usage = moe_stats['expert_usage']
-                            expert_usages.append(expert_usage)
-                            # 记录每个专家的使用率
-                            for j, usage in enumerate(expert_usage):
-                                loss_dict[f'moe/block_{i}/expert_{j}_usage'] = float(usage)
+                            expert_usages.append(moe_stats['expert_usage'])
                         
-                        # 记录路由分数
-                        if 'router_scores' in moe_stats:
-                            router_scores = moe_stats['router_scores']
-                            router_scores_list.append(router_scores)
-                            # 记录每个专家的路由分数
-                            for j, score in enumerate(router_scores):
-                                loss_dict[f'moe/block_{i}/expert_{j}_router_score'] = float(score)
+                        # 🔥 收集专家熵值（核心指标1）
+                        if 'expert_entropy_normalized' in moe_stats:
+                            expert_entropies_normalized.append(moe_stats['expert_entropy_normalized'])
                         
-                        # 记录topk权重平均值
-                        if 'topk_weights_mean' in moe_stats:
-                            topk_weights_means.append(moe_stats['topk_weights_mean'])
-                            loss_dict[f'moe/block_{i}/topk_weights_mean'] = moe_stats['topk_weights_mean']
+                        # 🔥 收集Gate激活统计（核心指标2）
+                        if 'gate_activation_mean' in moe_stats:
+                            gate_activation_means.append(moe_stats['gate_activation_mean'])
+                        
+                        if 'gate_activation_std' in moe_stats:
+                            gate_activation_stds.append(moe_stats['gate_activation_std'])
             
-            # 记录整体MoE统计
+            # ========== 全局MoE统计（只记录这些） ==========
+            # 1. MoE专家负载
             if moe_aux_losses:
-                loss_dict['moe/avg_aux_loss'] = sum(moe_aux_losses) / len(moe_aux_losses)
+                avg_aux_loss = sum(moe_aux_losses) / len(moe_aux_losses)
+                loss_dict['moe/avg_aux_loss'] = avg_aux_loss
+                
+                # 🔥🔥🔥 关键修复：将aux_loss加入到总loss中进行反向传播！
+                # 这是gate梯度的唯一来源，之前被遗漏导致gate梯度始终为0
+                loss = loss + avg_aux_loss
+            
+            if expert_entropies_normalized:
+                avg_entropy_norm = sum(expert_entropies_normalized) / len(expert_entropies_normalized)
+                loss_dict['moe/expert_entropy_normalized'] = avg_entropy_norm
+                # 警告：如果归一化熵值 < 0.5，说明专家坍缩严重
+                loss_dict['moe/expert_collapse_warning'] = 1.0 if avg_entropy_norm < 0.5 else 0.0
             
             if expert_usages:
                 # 计算所有block的平均专家使用率
                 avg_expert_usage = sum(expert_usages) / len(expert_usages)
-                for j, usage in enumerate(avg_expert_usage):
-                    loss_dict[f'moe/avg_expert_{j}_usage'] = float(usage)
                 # 记录专家使用的标准差（负载均衡指标）
                 loss_dict['moe/expert_usage_std'] = float(avg_expert_usage.std())
-                loss_dict['moe/expert_usage_max'] = float(avg_expert_usage.max())
-                loss_dict['moe/expert_usage_min'] = float(avg_expert_usage.min())
             
-            if router_scores_list:
-                # 计算所有block的平均路由分数
-                avg_router_scores = sum(router_scores_list) / len(router_scores_list)
-                for j, score in enumerate(avg_router_scores):
-                    loss_dict[f'moe/avg_expert_{j}_router_score'] = float(score)
+            # 2. Gate-Attention激活
+            if gate_activation_means:
+                avg_gate_mean = sum(gate_activation_means) / len(gate_activation_means)
+                loss_dict['gate/activation_mean'] = avg_gate_mean
+                # 警告：如果所有gate激活值都接近1，说明门控没有起到过滤作用
+                loss_dict['gate/no_filtering_warning'] = 1.0 if avg_gate_mean > 0.95 else 0.0
             
-            if topk_weights_means:
-                loss_dict['moe/avg_topk_weights_mean'] = sum(topk_weights_means) / len(topk_weights_means)
+            if gate_activation_stds:
+                loss_dict['gate/activation_std'] = sum(gate_activation_stds) / len(gate_activation_stds)
 
         return loss, loss_dict

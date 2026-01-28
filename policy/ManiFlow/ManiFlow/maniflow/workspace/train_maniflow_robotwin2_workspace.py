@@ -323,10 +323,42 @@ class TrainManiFlowRoboTwinWorkspace:
                             
                             t1_2 = time.time()
                             
+                            # ========== 3. 梯度范数监控（Gradient Norms）- 核心指标3 ==========
+                            # 在optimizer.step()之前记录梯度范数（全局平均）
+                            if self.global_step % 100 == 0:  # 每100步记录一次
+                                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                                if hasattr(unwrapped_model, 'model') and hasattr(unwrapped_model.model, 'blocks'):
+                                    moe_gate_grad_norms = []
+                                    
+                                    for block in unwrapped_model.model.blocks:
+                                        # 收集MoE路由权重的梯度
+                                        if hasattr(block, 'token_moe') and hasattr(block.token_moe, 'gate'):
+                                            gate_weight = block.token_moe.gate.weight
+                                            if gate_weight.grad is not None:
+                                                moe_gate_grad_norms.append(gate_weight.grad.norm().item())
+                                    
+                                    # 只记录全局平均值
+                                    if moe_gate_grad_norms:
+                                        avg_grad_norm = sum(moe_gate_grad_norms) / len(moe_gate_grad_norms)
+                                        loss_dict['grad/moe_gate_grad_norm'] = avg_grad_norm
+                                        loss_dict['grad/moe_gate_grad_overflow'] = 1.0 if avg_grad_norm > 10.0 else 0.0
+                            
+                            # 🔥 Gradient Clipping (解决MoE梯度爆炸)
+                            if cfg.training.get('max_grad_norm', None) is not None:
+                                self.accelerator.clip_grad_norm_(self.model.parameters(), cfg.training.max_grad_norm)
+                            
                             # Optimizer step (only when accumulated enough gradients)
                             self.optimizer.step()
                             lr_scheduler.step()
                             self.optimizer.zero_grad()
+                            
+                            # 🔥 重置MoE梯度累积统计（防止aux_loss累积导致梯度爆炸）
+                            if cfg.policy.get('enable_grad_accumulation', False):
+                                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                                if hasattr(unwrapped_model, 'model') and hasattr(unwrapped_model.model, 'blocks'):
+                                    for block in unwrapped_model.model.blocks:
+                                        if hasattr(block, 'token_moe'):
+                                            block.token_moe.reset_gate_accumulation()
                             
                             t1_3 = time.time()
                         
@@ -361,9 +393,39 @@ class TrainManiFlowRoboTwinWorkspace:
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                            # ========== 3. 梯度范数监控（Gradient Norms）- 核心指标3 ==========
+                            # 在optimizer.step()之前记录梯度范数（全局平均）
+                            if self.global_step % 100 == 0:  # 每100步记录一次
+                                if hasattr(self.model, 'model') and hasattr(self.model.model, 'blocks'):
+                                    moe_gate_grad_norms = []
+                                    
+                                    for block in self.model.model.blocks:
+                                        # 收集MoE路由权重的梯度
+                                        if hasattr(block, 'token_moe') and hasattr(block.token_moe, 'gate'):
+                                            gate_weight = block.token_moe.gate.weight
+                                            if gate_weight.grad is not None:
+                                                moe_gate_grad_norms.append(gate_weight.grad.norm().item())
+                                    
+                                    # 只记录全局平均值
+                                    if moe_gate_grad_norms:
+                                        avg_grad_norm = sum(moe_gate_grad_norms) / len(moe_gate_grad_norms)
+                                        loss_dict['grad/moe_gate_grad_norm'] = avg_grad_norm
+                                        loss_dict['grad/moe_gate_grad_overflow'] = 1.0 if avg_grad_norm > 10.0 else 0.0
+                            
+                            # 🔥 Gradient Clipping (解决MoE梯度爆炸)
+                            if cfg.training.get('max_grad_norm', None) is not None:
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.training.max_grad_norm)
+                            
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
+                            
+                            # 🔥 重置MoE梯度累积统计（防止aux_loss累积导致梯度爆炸）
+                            if cfg.policy.get('enable_grad_accumulation', False):
+                                if hasattr(self.model, 'model') and hasattr(self.model.model, 'blocks'):
+                                    for block in self.model.model.blocks:
+                                        if hasattr(block, 'token_moe'):
+                                            block.token_moe.reset_gate_accumulation()
                         t1_3 = time.time()
                         
                         # update ema
@@ -410,29 +472,6 @@ class TrainManiFlowRoboTwinWorkspace:
                     if not is_last_batch:
                         # log of last step is combined with validation and rollout
                         if WANDB and (not self.use_accelerate or self.accelerator.is_main_process):
-                            #每100步记录一次 MoE gate 权重的直方图
-                            if self.global_step % 100 == 0:
-                                if self.use_accelerate:
-                                    model_to_log = self.accelerator.unwrap_model(self.model)
-                                else:
-                                    model_to_log = self.model
-                                
-                                if hasattr(model_to_log, 'model') and hasattr(model_to_log.model, 'blocks'):
-                                    for i, block in enumerate(model_to_log.model.blocks):
-                                        # 支持两种MoE结构：
-                                        # 1. DiTXMoE: block.modality_moe.gate_proj
-                                        # 2. SparseMoeBlock: block.mlp.gate.weight
-                                        if hasattr(block, 'modality_moe') and hasattr(block.modality_moe, 'gate_proj'):
-                                            # DiTXMoE结构：模态级别MoE
-                                            gate_weights = block.modality_moe.gate_proj.weight.detach().cpu().numpy()
-                                            step_log[f'moe/block_{i}/gate_weights'] = wandb.Histogram(gate_weights)
-                                            step_log[f'moe/block_{i}/gate_weights_mean'] = float(gate_weights.mean())
-                                            step_log[f'moe/block_{i}/gate_weights_std'] = float(gate_weights.std())
-                                        elif hasattr(block, 'mlp') and hasattr(block.mlp, 'gate'):
-                                            # SparseMoeBlock结构：token级别MoE
-                                            gate_weights = block.mlp.gate.weight.detach().cpu().numpy()
-                                            step_log[f'moe/block_{i}/gate_weights'] = wandb.Histogram(gate_weights)
-                            
                             wandb_run.log(step_log, step=self.global_step)
                         self.global_step += 1
 
@@ -586,40 +625,6 @@ class TrainManiFlowRoboTwinWorkspace:
             # end of epoch
             # log of last step is combined with validation and rollout
             if WANDB and (not self.use_accelerate or self.accelerator.is_main_process):
-                #每个 epoch 结束时记录 MoE 参数的详细统计
-                if self.use_accelerate:
-                    model_to_log = self.accelerator.unwrap_model(self.model)
-                else:
-                    model_to_log = self.model
-                
-                if hasattr(model_to_log, 'model') and hasattr(model_to_log.model, 'blocks'):
-                    # 记录每个block的gate权重直方图和统计信息
-                    for i, block in enumerate(model_to_log.model.blocks):
-                        # 支持两种MoE结构：
-                        # 1. DiTXMoE: block.modality_moe.gate_proj
-                        # 2. SparseMoeBlock: block.mlp.gate.weight
-                        if hasattr(block, 'modality_moe') and hasattr(block.modality_moe, 'gate_proj'):
-                            # DiTXMoE结构：模态级别MoE
-                            gate_weights = block.modality_moe.gate_proj.weight.detach().cpu().numpy()
-                            step_log[f'moe_epoch/block_{i}/gate_weights_hist'] = wandb.Histogram(gate_weights)
-                            step_log[f'moe_epoch/block_{i}/gate_weights_mean'] = float(gate_weights.mean())
-                            step_log[f'moe_epoch/block_{i}/gate_weights_std'] = float(gate_weights.std())
-                            step_log[f'moe_epoch/block_{i}/gate_weights_max'] = float(gate_weights.max())
-                            step_log[f'moe_epoch/block_{i}/gate_weights_min'] = float(gate_weights.min())
-                            # 记录时间条件调制权重（如果存在）
-                            if hasattr(block.modality_moe, 'time_gate_modulation'):
-                                time_mod_weights = block.modality_moe.time_gate_modulation[-1].weight.detach().cpu().numpy()
-                                step_log[f'moe_epoch/block_{i}/time_mod_weights_hist'] = wandb.Histogram(time_mod_weights)
-                                step_log[f'moe_epoch/block_{i}/time_mod_weights_mean'] = float(time_mod_weights.mean())
-                        elif hasattr(block, 'mlp') and hasattr(block.mlp, 'gate'):
-                            # SparseMoeBlock结构：token级别MoE
-                            gate_weights = block.mlp.gate.weight.detach().cpu().numpy()
-                            step_log[f'moe_epoch/block_{i}/gate_weights_hist'] = wandb.Histogram(gate_weights)
-                            step_log[f'moe_epoch/block_{i}/gate_weights_mean'] = float(gate_weights.mean())
-                            step_log[f'moe_epoch/block_{i}/gate_weights_std'] = float(gate_weights.std())
-                            step_log[f'moe_epoch/block_{i}/gate_weights_max'] = float(gate_weights.max())
-                            step_log[f'moe_epoch/block_{i}/gate_weights_min'] = float(gate_weights.min())
-                
                 wandb_run.log(step_log, step=self.global_step)
             self.global_step += 1
             self.epoch += 1

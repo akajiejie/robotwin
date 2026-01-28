@@ -22,7 +22,7 @@ class MoEGate(nn.Module):
         enable_grad_accumulation: 是否启用梯度累积友好模式
     """
     def __init__(self, embed_dim, num_experts=16, num_experts_per_tok=2, aux_loss_alpha=0.01,
-                 use_time_cond=False, enable_grad_accumulation=False):
+                 enable_grad_accumulation=False):
         super().__init__()
         self.top_k = num_experts_per_tok
         self.n_routed_experts = num_experts
@@ -35,17 +35,6 @@ class MoEGate(nn.Module):
         self.norm_topk_prob = False
         self.gating_dim = embed_dim
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
-        
-        # 时间条件调制：让Gate感知扩散时间步
-        self.use_time_cond = use_time_cond
-        if use_time_cond:
-            # 时间条件通过调制gate权重实现
-            self.time_gate_modulation = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(embed_dim, self.n_routed_experts * 2)  # scale和shift
-            )
-            nn.init.zeros_(self.time_gate_modulation[-1].weight)
-            nn.init.zeros_(self.time_gate_modulation[-1].bias)
         
         # 梯度累积支持：累积多个micro-batch的统计信息
         self.enable_grad_accumulation = enable_grad_accumulation
@@ -70,11 +59,10 @@ class MoEGate(nn.Module):
             self._accumulated_tokens.zero_()
             self._accumulation_steps.zero_()
     
-    def forward(self, hidden_states, time_cond=None):
+    def forward(self, hidden_states):
         """
         Args:
             hidden_states: (B, L, D) 输入特征
-            time_cond: (B, D) 时间条件嵌入，用于调制门控
         """
         bsz, seq_len, h = hidden_states.shape    
         
@@ -91,16 +79,6 @@ class MoEGate(nn.Module):
         ### compute gating score
         hidden_states_flat = hidden_states.view(-1, h)
         logits = F.linear(hidden_states_flat, self.weight, None)
-        
-        # 时间条件调制：根据扩散阶段调整专家偏好
-        if self.use_time_cond and time_cond is not None:
-            # time_cond: (B, D) -> modulation: (B, num_experts*2)
-            modulation = self.time_gate_modulation(time_cond)
-            scale, shift = modulation.chunk(2, dim=-1)  # (B, num_experts) each
-            # 扩展到所有token: (B, 1, num_experts) -> (B*L, num_experts)
-            scale = scale.unsqueeze(1).expand(-1, seq_len, -1).reshape(-1, self.n_routed_experts)
-            shift = shift.unsqueeze(1).expand(-1, seq_len, -1).reshape(-1, self.n_routed_experts)
-            logits = logits * (1 + scale) + shift
         
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
@@ -254,17 +232,15 @@ class SparseMoeBlock(nn.Module):
         n_shared_experts: 共享专家数量 (默认2)
         pretraining_tp: 张量并行度
         aux_loss_alpha: 辅助损失权重
-        use_time_cond: 是否使用时间条件调制门控
         enable_grad_accumulation: 是否启用梯度累积友好模式
     """
     def __init__(self, embed_dim, mlp_ratio=4, num_experts=16, num_experts_per_tok=2, 
-                 n_shared_experts=2, pretraining_tp=1, aux_loss_alpha=0.01, use_time_cond=False,
+                 n_shared_experts=2, pretraining_tp=1, aux_loss_alpha=0.01,
                  enable_grad_accumulation=False):
         super().__init__()
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
         self.num_experts = num_experts
-        self.use_time_cond = use_time_cond
         self.enable_grad_accumulation = enable_grad_accumulation
         
         # 用于累积MoE统计信息
@@ -278,12 +254,11 @@ class SparseMoeBlock(nn.Module):
             for i in range(num_experts)
         ])
         
-        # 门控网络（支持时间条件和梯度累积）
+        # 门控网络（支持梯度累积）
         self.gate = MoEGate(embed_dim=embed_dim, 
                            num_experts=num_experts, 
                            num_experts_per_tok=num_experts_per_tok,
                            aux_loss_alpha=aux_loss_alpha,
-                           use_time_cond=use_time_cond,
                            enable_grad_accumulation=enable_grad_accumulation)
         
         # 共享专家
@@ -298,11 +273,10 @@ class SparseMoeBlock(nn.Module):
         if self.enable_grad_accumulation:
             self.gate.reset_accumulation()
     
-    def forward(self, hidden_states, time_cond=None):
+    def forward(self, hidden_states):
         """
         Args:
             hidden_states: (batch_size, seq_len, embed_dim)
-            time_cond: (batch_size, embed_dim) 时间条件嵌入
             
         Returns:
             output: (batch_size, seq_len, embed_dim)
@@ -314,8 +288,8 @@ class SparseMoeBlock(nn.Module):
         identity = hidden_states
         orig_shape = hidden_states.shape
         
-        # 门控路由（传入时间条件）
-        topk_idx, topk_weight, aux_loss, router_probs = self.gate(hidden_states, time_cond) 
+        # 门控路由
+        topk_idx, topk_weight, aux_loss, router_probs = self.gate(hidden_states) 
         
         # 保存MoE统计信息用于wandb记录
         if self.training and router_probs is not None:

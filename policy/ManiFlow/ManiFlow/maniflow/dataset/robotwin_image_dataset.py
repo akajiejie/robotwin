@@ -3,8 +3,6 @@ from typing import Dict, Optional, List
 import torch
 import numpy as np
 import copy
-import zarr  
-import numcodecs  
 from maniflow.common.pytorch_util import dict_apply
 from maniflow.common.replay_buffer import ReplayBuffer
 from maniflow.common.sampler import (
@@ -94,35 +92,9 @@ class RoboTwinImageDataset(BaseDataset):
         buffer_keys = self._get_required_buffer_keys()
         cprint(f"Loading buffer keys: {buffer_keys}", 'green')
         
-        # 🔥 直接从磁盘按需读取,不加载到内存 (数据集78GB,内存只有110GB)
-        cprint(f"⚠️  Using on-demand disk loading mode (NO memory copy) - dataset is 78GB", 'red')
-        cprint(f"⚠️  Data will be read from disk on-the-fly, may be slower but avoids OOM", 'yellow')
-        # 直接打开zarr文件,不复制到内存
-        import zarr as zarr_lib
-        zarr_group = zarr_lib.open(zarr_path, mode='r')
-        
-        # 创建过滤后的视图(只包含需要的keys)
-        filtered_data = {}
-        for key in buffer_keys:
-            if key in zarr_group['data']:
-                filtered_data[key] = zarr_group['data'][key]
-        
-        # 构造ReplayBuffer需要的结构
-        # meta需要转换为numpy数组(只有元数据,很小)
-        meta_dict = {}
-        for key, value in zarr_group['meta'].items():
-            if hasattr(value, 'shape') and len(value.shape) == 0:
-                # 标量
-                meta_dict[key] = np.array(value)
-            else:
-                # 数组(episode_ends等,很小,可以加载到内存)
-                meta_dict[key] = value[:]
-        
-        root = {
-            'meta': meta_dict,
-            'data': filtered_data
-        }
-        self.replay_buffer = ReplayBuffer(root=root)
+        # 加载数据
+        self.replay_buffer = ReplayBuffer.copy_from_path(
+                zarr_path, keys=buffer_keys)
 
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes, 

@@ -42,10 +42,9 @@ class DiTXMoE(nn.Module):
     
     核心改进：
     1. Token级别MoE路由：每个token独立选择专家，细粒度的特征处理
-    2. 时间条件感知：MoE门控感知扩散时间步，根据噪声阶段调整专家选择
-    3. 专家自动学习：在不同时间步下关注不同模态的token特征
-    4. Gate-Attention：Cross-attention支持可学习的gate调制（参考Qwen3）
-    5. 🆕 模态嵌入：为不同模态添加可学习的标识符，帮助模型和MoE Gate区分模态
+    2. 专家自动学习：自动学习不同模态token的特征处理
+    3. Gate-Attention：Cross-attention支持可学习的gate调制（参考Qwen3）
+    4. 🆕 模态嵌入：为不同模态添加可学习的标识符，帮助模型和MoE Gate区分模态
     """
     def __init__(
         self,
