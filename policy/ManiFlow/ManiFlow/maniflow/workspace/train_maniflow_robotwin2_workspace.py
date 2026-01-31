@@ -21,6 +21,7 @@ def _copy_to_cpu(x):
         return copy.deepcopy(x)
 
 import os
+import logging
 import hydra
 import torch
 import dill
@@ -28,6 +29,8 @@ from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
 import copy
+
+logger = logging.getLogger(__name__)
 import random
 import wandb
 import tqdm
@@ -38,8 +41,6 @@ import time
 import threading
 import sys
 import gc
-from accelerate import Accelerator
-from accelerate.utils import set_seed
 
 MANIFLOW_ROOT = str(pathlib.Path(__file__).parent.parent.parent.parent)
 sys.path.append(MANIFLOW_ROOT)
@@ -93,35 +94,11 @@ class TrainManiFlowRoboTwinWorkspace:
         self._output_dir = output_dir
         self._saving_thread = None
         
-        # 🔥 Initialize Accelerator if enabled
-        self.use_accelerate = cfg.training.get('use_accelerate', False)
-        self.accelerator = None
-        
-        if self.use_accelerate:
-            # 从配置中获取梯度累积步数
-            gradient_accumulation_steps = cfg.training.get('gradient_accumulate_every', 1)
-            
-            self.accelerator = Accelerator(
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                mixed_precision=cfg.training.get('mixed_precision', 'no'),  # 'no', 'fp16', 'bf16'
-                log_with="wandb" if cfg.training.get('use_wandb', True) else None,
-                project_dir=output_dir,
-            )
-            
-            # Use accelerate's set_seed for better reproducibility
-            set_seed(cfg.training.seed, device_specific=True)
-            
-            cprint(f"🚀 Accelerate initialized:", 'cyan')
-            cprint(f"   - Gradient accumulation steps: {gradient_accumulation_steps}", 'cyan')
-            cprint(f"   - Mixed precision: {cfg.training.get('mixed_precision', 'no')}", 'cyan')
-            cprint(f"   - Device: {self.accelerator.device}", 'cyan')
-            cprint(f"   - Num processes: {self.accelerator.num_processes}", 'cyan')
-        else:
-            # Original seed setting
-            seed = cfg.training.seed
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-            random.seed(seed)
+        # Set random seed
+        seed = cfg.training.seed
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
         # configure model
         self.model: ManiFlowTransformerPointcloudPolicy = hydra.utils.instantiate(cfg.policy)
@@ -204,9 +181,7 @@ class TrainManiFlowRoboTwinWorkspace:
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
+            num_training_steps=len(train_dataloader) * cfg.training.num_epochs,
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
             last_epoch=self.global_step-1
@@ -234,52 +209,25 @@ class TrainManiFlowRoboTwinWorkspace:
         cprint(f"[WandB] name: {cfg.logging.name}", "yellow")
         cprint("-----------------------------", "yellow")
         
-        # 🔥 Prepare with Accelerator if enabled
-        if self.use_accelerate:
-            # Prepare model, optimizer, dataloaders with accelerator
-            self.model, self.optimizer, train_dataloader, val_dataloader, lr_scheduler = \
-                self.accelerator.prepare(
-                    self.model, self.optimizer, train_dataloader, val_dataloader, lr_scheduler
-                )
-            
-            # EMA model should stay on the same device but not wrapped
-            if self.ema_model is not None:
-                self.ema_model.to(self.accelerator.device)
-            
-            device = self.accelerator.device
-            
-            # Initialize wandb through accelerator
-            if WANDB and self.accelerator.is_main_process:
-                wandb_run = wandb.init(
-                    dir=str(self.output_dir),
-                    config=OmegaConf.to_container(cfg, resolve=True),
-                    **cfg.logging
-                )
-                wandb.config.update({"output_dir": self.output_dir})
-            else:
-                wandb_run = None
-                
-            cprint(f"✅ Models and optimizers prepared with Accelerator", 'green')
-        else:
-            # Original device transfer
-            device = torch.device(cfg.training.device)
-            self.model.to(device)
-            if self.ema_model is not None:
-                self.ema_model.to(device)
-            optimizer_to(self.optimizer, device)
-            
-            # configure logging
-            if WANDB:
-                wandb_run = wandb.init(
-                    dir=str(self.output_dir),
-                    config=OmegaConf.to_container(cfg, resolve=True),
-                    **cfg.logging
-                )
-                wandb.config.update(
-                    {
-                        "output_dir": self.output_dir,
-                    }
-                )
+        # Device transfer
+        device = torch.device(cfg.training.device)
+        self.model.to(device)
+        if self.ema_model is not None:
+            self.ema_model.to(device)
+        optimizer_to(self.optimizer, device)
+        
+        # Configure logging
+        if WANDB:
+            wandb_run = wandb.init(
+                dir=str(self.output_dir),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **cfg.logging
+            )
+            wandb.config.update(
+                {
+                    "output_dir": self.output_dir,
+                }
+            )
 
         # configure checkpoint
         topk_manager = TopKCheckpointManager(
@@ -305,145 +253,44 @@ class TrainManiFlowRoboTwinWorkspace:
                 for batch_idx, batch in enumerate(tepoch):
                     t1 = time.time()
                     
-                    # 🔥 Use Accelerate's gradient accumulation context if enabled
-                    if self.use_accelerate:
-                        # Accelerator handles device transfer automatically
-                        if train_sampling_batch is None:
-                            train_sampling_batch = dict_apply(batch, lambda x: x.clone().detach())
-                        
-                        t1_1 = time.time()
-                        
-                        # Use accumulate context for automatic gradient accumulation
-                        with self.accelerator.accumulate(self.model):
-                            # Forward pass
-                            raw_loss, loss_dict = self.model.compute_loss(batch, self.ema_model)
-                            
-                            # Accelerator handles scaling automatically
-                            self.accelerator.backward(raw_loss)
-                            
-                            t1_2 = time.time()
-                            
-                            # ========== 3. 梯度范数监控（Gradient Norms）- 核心指标3 ==========
-                            # 在optimizer.step()之前记录梯度范数（全局平均）
-                            if self.global_step % 100 == 0:  # 每100步记录一次
-                                unwrapped_model = self.accelerator.unwrap_model(self.model)
-                                if hasattr(unwrapped_model, 'model') and hasattr(unwrapped_model.model, 'blocks'):
-                                    moe_gate_grad_norms = []
-                                    
-                                    for block in unwrapped_model.model.blocks:
-                                        # 收集MoE路由权重的梯度
-                                        if hasattr(block, 'token_moe') and hasattr(block.token_moe, 'gate'):
-                                            gate_weight = block.token_moe.gate.weight
-                                            if gate_weight.grad is not None:
-                                                moe_gate_grad_norms.append(gate_weight.grad.norm().item())
-                                    
-                                    # 只记录全局平均值
-                                    if moe_gate_grad_norms:
-                                        avg_grad_norm = sum(moe_gate_grad_norms) / len(moe_gate_grad_norms)
-                                        loss_dict['grad/moe_gate_grad_norm'] = avg_grad_norm
-                                        loss_dict['grad/moe_gate_grad_overflow'] = 1.0 if avg_grad_norm > 10.0 else 0.0
-                            
-                            # 🔥 Gradient Clipping (解决MoE梯度爆炸)
-                            if cfg.training.get('max_grad_norm', None) is not None:
-                                self.accelerator.clip_grad_norm_(self.model.parameters(), cfg.training.max_grad_norm)
-                            
-                            # Optimizer step (only when accumulated enough gradients)
-                            self.optimizer.step()
-                            lr_scheduler.step()
-                            self.optimizer.zero_grad()
-                            
-                            # 🔥 重置MoE梯度累积统计（防止aux_loss累积导致梯度爆炸）
-                            if cfg.policy.get('enable_grad_accumulation', False):
-                                unwrapped_model = self.accelerator.unwrap_model(self.model)
-                                if hasattr(unwrapped_model, 'model') and hasattr(unwrapped_model.model, 'blocks'):
-                                    for block in unwrapped_model.model.blocks:
-                                        if hasattr(block, 'token_moe'):
-                                            block.token_moe.reset_gate_accumulation()
-                            
-                            t1_3 = time.time()
-                        
-                        # Update EMA (outside accumulate context)
-                        if cfg.training.use_ema:
-                            # Get unwrapped model for EMA update
-                            unwrapped_model = self.accelerator.unwrap_model(self.model)
-                            ema.step(unwrapped_model)
-                        
-                        t1_4 = time.time()
-                        
-                        # Gather loss from all processes
-                        raw_loss_cpu = self.accelerator.gather(raw_loss).mean().item()
-                        
-                    else:
-                        # Original training loop (without accelerate)
-                        # device transfer
-                        batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                        if train_sampling_batch is None:
-                            train_sampling_batch = dict_apply(batch, lambda x: x.clone().detach())
+                    # Device transfer
+                    batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                    if train_sampling_batch is None:
+                        train_sampling_batch = dict_apply(batch, lambda x: x.clone().detach())
+                
+                    # Compute loss
+                    t1_1 = time.time()
                     
-                        # compute loss
-                        t1_1 = time.time()
-                        
-                        # Forward pass
-                        raw_loss, loss_dict = self.model.compute_loss(batch, self.ema_model)
-                        
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
-                        
-                        t1_2 = time.time()
+                    # Forward pass
+                    raw_loss, loss_dict = self.model.compute_loss(batch, self.ema_model)
+                    
+                    raw_loss.backward()
+                    
+                    t1_2 = time.time()
 
-                        # step optimizer
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
-                            # ========== 3. 梯度范数监控（Gradient Norms）- 核心指标3 ==========
-                            # 在optimizer.step()之前记录梯度范数（全局平均）
-                            if self.global_step % 100 == 0:  # 每100步记录一次
-                                if hasattr(self.model, 'model') and hasattr(self.model.model, 'blocks'):
-                                    moe_gate_grad_norms = []
-                                    
-                                    for block in self.model.model.blocks:
-                                        # 收集MoE路由权重的梯度
-                                        if hasattr(block, 'token_moe') and hasattr(block.token_moe, 'gate'):
-                                            gate_weight = block.token_moe.gate.weight
-                                            if gate_weight.grad is not None:
-                                                moe_gate_grad_norms.append(gate_weight.grad.norm().item())
-                                    
-                                    # 只记录全局平均值
-                                    if moe_gate_grad_norms:
-                                        avg_grad_norm = sum(moe_gate_grad_norms) / len(moe_gate_grad_norms)
-                                        loss_dict['grad/moe_gate_grad_norm'] = avg_grad_norm
-                                        loss_dict['grad/moe_gate_grad_overflow'] = 1.0 if avg_grad_norm > 10.0 else 0.0
-                            
-                            # 🔥 Gradient Clipping (解决MoE梯度爆炸)
-                            if cfg.training.get('max_grad_norm', None) is not None:
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.training.max_grad_norm)
-                            
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            lr_scheduler.step()
-                            
-                            # 🔥 重置MoE梯度累积统计（防止aux_loss累积导致梯度爆炸）
-                            if cfg.policy.get('enable_grad_accumulation', False):
-                                if hasattr(self.model, 'model') and hasattr(self.model.model, 'blocks'):
-                                    for block in self.model.model.blocks:
-                                        if hasattr(block, 'token_moe'):
-                                            block.token_moe.reset_gate_accumulation()
-                        t1_3 = time.time()
-                        
-                        # update ema
-                        if cfg.training.use_ema:
-                            ema.step(self.model)
-                        t1_4 = time.time()
-                        
-                        raw_loss_cpu = raw_loss.item()
+                    # Gradient Clipping
+                    if cfg.training.get('max_grad_norm', None) is not None:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.training.max_grad_norm)
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    lr_scheduler.step()
+                    
+                    t1_3 = time.time()
+                    
+                    # Update EMA
+                    if cfg.training.use_ema:
+                        ema.step(self.model)
+                    t1_4 = time.time()
+                    
+                    raw_loss_cpu = raw_loss.item()
                     
                     # logging
                     tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                     train_losses.append(raw_loss_cpu)
                     
-                    # Get learning rate safely
-                    if self.use_accelerate:
-                        current_lr = self.optimizer.param_groups[0]['lr']
-                    else:
-                        current_lr = lr_scheduler.get_last_lr()[0]
+                    # Get learning rate
+                    current_lr = lr_scheduler.get_last_lr()[0]
                     
                     step_log = {
                         'train_loss': raw_loss_cpu,
@@ -453,6 +300,39 @@ class TrainManiFlowRoboTwinWorkspace:
                     }
                     t1_5 = time.time()
                     step_log.update(loss_dict)
+                    
+                    # ========== Attention Weight Recording ==========
+                    # Record attention statistics periodically (every 500 steps)
+                    if self.global_step % 500 == 0 and self.global_step > 0:
+                        try:
+                            # Enable attention recording via policy interface
+                            if hasattr(self.model, 'set_record_attn'):
+                                self.model.set_record_attn(True)
+                                
+                                # Run a forward pass to record attention
+                                with torch.no_grad():
+                                    sample_batch = dict_apply(batch, lambda x: x[:4].to(device))  # Use small batch
+                                    _ = self.model.compute_loss(sample_batch, self.ema_model)
+                                
+                                # Get simplified global attention statistics
+                                attn_stats = self.model.get_attn_stats()
+                                if attn_stats is not None:
+                                    # Core metrics (always available)
+                                    step_log['attn/entropy'] = attn_stats['entropy']
+                                    step_log['attn/entropy_diff'] = attn_stats['entropy_early_late_diff']
+                                    
+                                    # Modality attention (if token structure matches)
+                                    if 'modality_rgb' in attn_stats:
+                                        step_log['attn/modality_rgb'] = attn_stats['modality_rgb']
+                                        step_log['attn/modality_tactile'] = attn_stats['modality_tactile']
+                                        step_log['attn/modality_proprio'] = attn_stats['modality_proprio']
+                                        step_log['attn/time_recent'] = attn_stats['time_recent_ratio']
+                                
+                                # Disable attention recording
+                                self.model.set_record_attn(False)
+                        except Exception as e:
+                            logger.warning(f"Attention recording failed: {e}")
+                    
                     t2 = time.time()
                     
                     # Periodic memory cleanup
@@ -471,7 +351,7 @@ class TrainManiFlowRoboTwinWorkspace:
                     is_last_batch = (batch_idx == (len(train_dataloader)-1))
                     if not is_last_batch:
                         # log of last step is combined with validation and rollout
-                        if WANDB and (not self.use_accelerate or self.accelerator.is_main_process):
+                        if WANDB:
                             wandb_run.log(step_log, step=self.global_step)
                         self.global_step += 1
 
@@ -520,17 +400,12 @@ class TrainManiFlowRoboTwinWorkspace:
                     with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                             leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
-                            if not self.use_accelerate:
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
 
                             # Forward pass
                             loss, loss_dict = self.model.compute_loss(batch, self.ema_model)
                             
-                            # Handle loss gathering for accelerate
-                            if self.use_accelerate:
-                                loss_value = self.accelerator.gather(loss).mean().item()
-                            else:
-                                loss_value = loss.item()
+                            loss_value = loss.item()
                             
                             val_losses.append(loss_value)
                             print(f'epoch {self.epoch}, eval loss: ', loss_value)
@@ -551,10 +426,7 @@ class TrainManiFlowRoboTwinWorkspace:
             if (self.epoch % cfg.training.sample_every) == 0:
                 with torch.no_grad():
                     # sample trajectory from training set, and evaluate difference
-                    if not self.use_accelerate:
-                        batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
-                    else:
-                        batch = train_sampling_batch
+                    batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                     
                     obs_dict = batch['obs']
                     gt_action = batch['action']
@@ -563,10 +435,7 @@ class TrainManiFlowRoboTwinWorkspace:
                     pred_action = result['action_pred']
                     mse = torch.nn.functional.mse_loss(pred_action, gt_action)
                     
-                    if self.use_accelerate:
-                        mse_value = self.accelerator.gather(mse).mean().item()
-                    else:
-                        mse_value = mse.item()
+                    mse_value = mse.item()
                     
                     step_log['train_action_mse_error'] = mse_value
                     del batch
@@ -580,10 +449,7 @@ class TrainManiFlowRoboTwinWorkspace:
                 step_log['test_mean_score'] = - train_loss
 
             # checkpoint - 定期保存（独立于checkpoint_every）
-            # Only save on main process when using accelerate
-            should_save = (not self.use_accelerate) or self.accelerator.is_main_process
-            
-            if should_save:
+            if True:
                 save_every = cfg.checkpoint.get('save_every', 100)  # 默认100
                 if self.epoch % save_every == 0 and self.epoch > 0 and cfg.checkpoint.save_ckpt:
                     epoch_ckpt_path = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{self.epoch:04d}.ckpt')
@@ -624,7 +490,7 @@ class TrainManiFlowRoboTwinWorkspace:
 
             # end of epoch
             # log of last step is combined with validation and rollout
-            if WANDB and (not self.use_accelerate or self.accelerator.is_main_process):
+            if WANDB:
                 wandb_run.log(step_log, step=self.global_step)
             self.global_step += 1
             self.epoch += 1
@@ -721,18 +587,10 @@ class TrainManiFlowRoboTwinWorkspace:
             if hasattr(value, 'state_dict') and hasattr(value, 'load_state_dict'):
                 # modules, optimizers and samplers etc
                 if key not in exclude_keys:
-                    # 🔥 Unwrap model if using accelerate
-                    if self.use_accelerate and key == 'model':
-                        unwrapped_model = self.accelerator.unwrap_model(value)
-                        if use_thread:
-                            payload['state_dicts'][key] = _copy_to_cpu(unwrapped_model.state_dict())
-                        else:
-                            payload['state_dicts'][key] = unwrapped_model.state_dict()
+                    if use_thread:
+                        payload['state_dicts'][key] = _copy_to_cpu(value.state_dict())
                     else:
-                        if use_thread:
-                            payload['state_dicts'][key] = _copy_to_cpu(value.state_dict())
-                        else:
-                            payload['state_dicts'][key] = value.state_dict()
+                        payload['state_dicts'][key] = value.state_dict()
             elif key in include_keys:
                 payload['pickles'][key] = dill.dumps(value)
         # Wait for previous saving thread to complete

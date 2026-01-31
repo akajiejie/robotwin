@@ -69,7 +69,6 @@ class TimmObsEncoder(ModuleAttrMixin):
             feature_aggregation: str='spatial_embedding',
             downsample_ratio: int=32,
             position_encording: str='learnable',
-            # 🆕 输出token序列而非拼接向量（用于模态级MoE）
             output_token_sequence: bool=False,
 
         ):

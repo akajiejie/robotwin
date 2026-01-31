@@ -1,5 +1,6 @@
 from typing import Dict, Tuple
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from einops import reduce
 from termcolor import cprint
@@ -10,7 +11,6 @@ from maniflow.common.pytorch_util import dict_apply
 from maniflow.common.model_util import print_params
 from maniflow.model.vision_2d.timm_obs_encoder import TimmObsEncoder
 from maniflow.model.diffusion.ditx import DiTX
-from maniflow.model.diffusion.ditx_moe import DiTXMoE
 from maniflow.model.common.sample_util import *
 
 class ManiFlowTransformerImagePolicy(BasePolicy):
@@ -40,24 +40,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             sample_t_mode_consistency="discrete",
             sample_dt_mode_consistency="uniform", 
             sample_target_t_mode="relative", # relative, absolute
-            # MoE配置参数
-            use_token_moe=False,             # 🔥 Token级MoE（原use_modality_moe）
-            num_experts=8,
-            num_experts_per_tok=2,
-            n_shared_experts=1,
-            moe_aux_loss_alpha=0.01,
-            enable_grad_accumulation=False,  # 🔥 梯度累积支持
-            gate_type='headwise',            # 🔥 Gate-Attention类型: 'none', 'headwise', 'elementwise'
-            # 🆕 模态嵌入配置
-            use_modality_embedding=True,
-            # 🆕 模态长度配置（用于模态嵌入）
-            head_cond_len=None,
-            wrist_cond_len=None,
             **kwargs):
         super().__init__()
-        
-        # 保存梯度累积配置
-        self.enable_grad_accumulation = enable_grad_accumulation
 
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
@@ -79,62 +63,26 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         if obs_as_global_cond:
             input_dim = action_dim
             global_cond_dim = obs_feature_dim
-
-        # 🆕 保存模态长度配置
-        self.head_cond_len = head_cond_len
-        self.wrist_cond_len = wrist_cond_len
         
-        # 创建ManiFlow模型 (支持DiTX和DiTXMoE)
-        if block_type == "DiTXMoE":
-            cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTXMoE模型", "cyan")
-            model = DiTXMoE(
-                input_dim=input_dim,
-                output_dim=action_dim,
-                horizon=horizon,
-                n_obs_steps=n_obs_steps,
-                cond_dim=global_cond_dim,
-                visual_cond_len=visual_cond_len,
-                diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
-                diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
-                n_layer=n_layer,
-                n_head=n_head,
-                n_emb=n_emb,
-                qkv_bias=qkv_bias,
-                qk_norm=qk_norm,
-                block_type=block_type,
-                language_conditioned=language_conditioned,
-                # MoE参数
-                use_token_moe=use_token_moe,               # 🔥 Token级MoE
-                num_experts=num_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                n_shared_experts=n_shared_experts,
-                moe_aux_loss_alpha=moe_aux_loss_alpha,
-                enable_grad_accumulation=enable_grad_accumulation,  # 🔥 梯度累积
-                gate_type=gate_type,                       # 🔥 Gate-Attention类型
-                # 🆕 模态嵌入和长度配置
-                use_modality_embedding=use_modality_embedding,
-                head_cond_len=head_cond_len,
-                wrist_cond_len=wrist_cond_len,
-            )
-        else:
-            cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTX模型", "cyan")
-            model = DiTX(
-                input_dim=input_dim,
-                output_dim=action_dim,
-                horizon=horizon,
-                n_obs_steps=n_obs_steps,
-                cond_dim=global_cond_dim,
-                visual_cond_len=visual_cond_len,
-                diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
-                diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
-                n_layer=n_layer,
-                n_head=n_head,
-                n_emb=n_emb,
-                qkv_bias=qkv_bias,
-                qk_norm=qk_norm,
-                block_type=block_type,
-                language_conditioned=language_conditioned,
-            )
+        # 创建DiTX模型
+        cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTX模型", "cyan")
+        model = DiTX(
+            input_dim=input_dim,
+            output_dim=action_dim,
+            horizon=horizon,
+            n_obs_steps=n_obs_steps,
+            cond_dim=global_cond_dim,
+            visual_cond_len=visual_cond_len,
+            diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
+            diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_emb=n_emb,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            block_type=block_type,
+            language_conditioned=language_conditioned,
+        )
         
         self.obs_encoder = obs_encoder
         self.model = model
@@ -174,6 +122,18 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         cprint(f"  - sample_target_t_mode: {self.sample_target_t_mode}", "yellow")
 
         print_params(self)
+    
+    # ========= Attention Recording ============
+    def set_record_attn(self, record: bool):
+        """Enable/disable attention weight recording in DiTX model"""
+        if hasattr(self.model, 'set_record_attn'):
+            self.model.set_record_attn(record)
+    
+    def get_attn_stats(self):
+        """Get attention statistics from DiTX model"""
+        if hasattr(self.model, 'get_attn_stats'):
+            return self.model.get_attn_stats()
+        return None
         
     # ========= inference  ============
     def conditional_sample(self, 
@@ -197,12 +157,6 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
            **kwargs)
         
         return ode_traj[-1] # sample ode returns the whole traj, return the last one
-    
-    def reset_moe_accumulation(self):
-        """重置MoE的累积统计（在optimizer.step()后调用）"""
-        if self.enable_grad_accumulation and hasattr(self.model, 'reset_moe_accumulation'):
-            self.model.reset_moe_accumulation()
-
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -236,25 +190,22 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].to(device))
         nobs_features = self.obs_encoder(this_nobs).to(device)
         
-        # 🆕 支持token序列输出模式
+        # 支持token序列输出模式
         if hasattr(self.obs_encoder, 'output_token_sequence') and self.obs_encoder.output_token_sequence:
             # Token序列模式: (B, L_tokens, D)
             vis_cond = nobs_features  # 已经是正确格式
-            # 获取模态长度信息
-            modality_lens = self.obs_encoder.get_modality_info()
         else:
-            # 原始模式: 拼接向量reshape
+            # 向量模式: 拼接向量reshape
             vis_cond = nobs_features.reshape(B, -1, Do)  # B, self.n_obs_steps*L, Do
-            modality_lens = None
+        
         # empty data for action
         cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
 
-        # run sampling (🆕 传递模态长度信息)
+        # run sampling
         nsample = self.conditional_sample(
             cond_data, 
             vis_cond=vis_cond,
             lang_cond=lang_cond,
-            modality_lens=modality_lens,
             **self.kwargs)
         
         # unnormalize prediction
@@ -536,13 +487,11 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             lambda x: x[:,:self.n_obs_steps,...].to(self.device))
         nobs_features = self.obs_encoder(this_nobs)
         
-        # 🆕 支持token序列输出模式
+        # 支持token序列输出模式
         if hasattr(self.obs_encoder, 'output_token_sequence') and self.obs_encoder.output_token_sequence:
             vis_cond = nobs_features  # 已经是 (B, L_tokens, D) 格式
-            modality_lens = self.obs_encoder.get_modality_info()
         else:
             vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
-            modality_lens = None
         
         """Get flow and consistency targets"""
         flow_batchsize = int(batch_size * self.flow_batch_ratio)
@@ -553,14 +502,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize], 
                                                     vis_cond=vis_cond[:flow_batchsize],
                                                     lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None)
-        # 🆕 传递模态长度信息给模型
         v_flow_pred = self.model(
             sample=flow_target_dict['x_t'], 
             timestep=flow_target_dict['t'].squeeze(),
             target_t=flow_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[:flow_batchsize],
-            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
-            modality_lens=modality_lens)
+            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None)
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
         # Get consistency targets
@@ -569,14 +516,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                                                                         lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
                                                                         ema_model=ema_model
                                                                         )
-        # 🆕 传递模态长度信息给模型
         v_ct_pred = self.model(
             sample=consistency_target_dict['x_t'], 
             timestep=consistency_target_dict['t'].squeeze(),
             target_t=consistency_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-            lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-            modality_lens=modality_lens)
+            lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None)
         v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
 
         """Compute losses"""
@@ -604,70 +549,5 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),
         }
-        
-        if hasattr(self.model, 'blocks') and self.training:
-            moe_aux_losses = []
-            expert_usages = []
-            expert_entropies_normalized = []  # 🔥 专家熵值（核心指标1）
-            gate_activation_means = []  # 🔥 Gate激活均值（核心指标2）
-            gate_activation_stds = []  # 🔥 Gate激活标准差
-            
-            for i, block in enumerate(self.model.blocks):
-                # 🔥 使用统一的get_moe_stats()方法获取MoE统计信息
-                moe_stats = None
-                if hasattr(block, 'get_moe_stats'):
-                    moe_stats = block.get_moe_stats()
-                
-                if moe_stats:
-                        # 收集辅助损失
-                        if 'aux_loss' in moe_stats:
-                            moe_aux_losses.append(moe_stats['aux_loss'])
-                        
-                        # 收集专家使用率
-                        if 'expert_usage' in moe_stats:
-                            expert_usages.append(moe_stats['expert_usage'])
-                        
-                        # 🔥 收集专家熵值（核心指标1）
-                        if 'expert_entropy_normalized' in moe_stats:
-                            expert_entropies_normalized.append(moe_stats['expert_entropy_normalized'])
-                        
-                        # 🔥 收集Gate激活统计（核心指标2）
-                        if 'gate_activation_mean' in moe_stats:
-                            gate_activation_means.append(moe_stats['gate_activation_mean'])
-                        
-                        if 'gate_activation_std' in moe_stats:
-                            gate_activation_stds.append(moe_stats['gate_activation_std'])
-            
-            # ========== 全局MoE统计（只记录这些） ==========
-            # 1. MoE专家负载
-            if moe_aux_losses:
-                avg_aux_loss = sum(moe_aux_losses) / len(moe_aux_losses)
-                loss_dict['moe/avg_aux_loss'] = avg_aux_loss
-                
-                # 🔥🔥🔥 关键修复：将aux_loss加入到总loss中进行反向传播！
-                # 这是gate梯度的唯一来源，之前被遗漏导致gate梯度始终为0
-                loss = loss + avg_aux_loss
-            
-            if expert_entropies_normalized:
-                avg_entropy_norm = sum(expert_entropies_normalized) / len(expert_entropies_normalized)
-                loss_dict['moe/expert_entropy_normalized'] = avg_entropy_norm
-                # 警告：如果归一化熵值 < 0.5，说明专家坍缩严重
-                loss_dict['moe/expert_collapse_warning'] = 1.0 if avg_entropy_norm < 0.5 else 0.0
-            
-            if expert_usages:
-                # 计算所有block的平均专家使用率
-                avg_expert_usage = sum(expert_usages) / len(expert_usages)
-                # 记录专家使用的标准差（负载均衡指标）
-                loss_dict['moe/expert_usage_std'] = float(avg_expert_usage.std())
-            
-            # 2. Gate-Attention激活
-            if gate_activation_means:
-                avg_gate_mean = sum(gate_activation_means) / len(gate_activation_means)
-                loss_dict['gate/activation_mean'] = avg_gate_mean
-                # 警告：如果所有gate激活值都接近1，说明门控没有起到过滤作用
-                loss_dict['gate/no_filtering_warning'] = 1.0 if avg_gate_mean > 0.95 else 0.0
-            
-            if gate_activation_stds:
-                loss_dict['gate/activation_std'] = sum(gate_activation_stds) / len(gate_activation_stds)
 
         return loss, loss_dict

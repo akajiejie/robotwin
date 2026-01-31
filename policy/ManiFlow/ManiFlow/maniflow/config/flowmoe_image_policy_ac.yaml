@@ -136,9 +136,7 @@ training:
   num_epochs: 201
   
   # 🔥 Accelerate配置
-  use_accelerate: true  # 启用accelerate
   gradient_accumulate_every: 8  # 🔥 减少梯度累积 (8 * 4 = 32 等效batch size)
-  mixed_precision: "no"  # 混合精度: "no", "fp16", "bf16" (可尝试bf16提速)
   use_wandb: true  # 是否使用wandb
   
   use_ema: True

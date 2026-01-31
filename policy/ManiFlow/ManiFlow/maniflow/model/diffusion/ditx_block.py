@@ -82,6 +82,18 @@ class CrossAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        
+        # Attention weight recording
+        self._last_attn_weights = None
+        self._record_attn = False
+    
+    def set_record_attn(self, record: bool):
+        """Enable/disable attention weight recording"""
+        self._record_attn = record
+    
+    def get_last_attn_weights(self):
+        """Get last recorded attention weights: (B, num_heads, N_action, L_context)"""
+        return self._last_attn_weights
     
     def forward(self, x: torch.Tensor, c: torch.Tensor, 
                 mask: None) -> torch.Tensor:
@@ -97,7 +109,23 @@ class CrossAttention(nn.Module):
             mask = mask.reshape(B, 1, 1, L)
             mask = mask.expand(-1, -1, N, -1)
         
-        if self.fused_attn:
+        # Always compute attention weights explicitly when recording is enabled
+        if self._record_attn or not self.fused_attn:
+            q_scaled = q * self.scale
+            attn = q_scaled @ k.transpose(-2, -1)
+            if mask is not None:
+                attn = attn.masked_fill_(mask.logical_not(), float('-inf'))
+            attn = attn.softmax(dim=-1)
+            
+            # Record attention weights
+            if self._record_attn:
+                self._last_attn_weights = attn.detach()
+            
+            if self.attn_drop.p > 0 and self.training:
+                attn = self.attn_drop(attn)
+            x = attn @ v
+        else:
+            # Use fused attention (faster but no weight access)
             x = F.scaled_dot_product_attention(
                 query=q,
                 key=k,
@@ -105,15 +133,6 @@ class CrossAttention(nn.Module):
                 dropout_p=self.attn_drop.p if self.training else 0.,
                 attn_mask=mask
             )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            if mask is not None:
-                attn = attn.masked_fill_(mask.logical_not(), float('-inf'))
-            attn = attn.softmax(dim=-1)
-            if self.attn_drop.p > 0:
-                attn = self.attn_drop(attn)
-            x = attn @ v
             
         x = x.permute(0, 2, 1, 3).reshape(B, N, C)
         x = self.proj(x)
@@ -127,6 +146,7 @@ class DiTXBlock(nn.Module):
         super().__init__()
         
         self.hidden_size = hidden_size
+        self.num_heads = num_heads
 
         # Self-Attention
         self.self_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True, 
@@ -156,6 +176,14 @@ class DiTXBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, modulation_size, bias=True)
         )
+    
+    def set_record_attn(self, record: bool):
+        """Enable/disable cross-attention weight recording"""
+        self.cross_attn.set_record_attn(record)
+    
+    def get_cross_attn_weights(self):
+        """Get last recorded cross-attention weights: (B, num_heads, N_action, L_context)"""
+        return self.cross_attn.get_last_attn_weights()
         
     def forward(self, x, time_c, context_c, attn_mask=None):
         """

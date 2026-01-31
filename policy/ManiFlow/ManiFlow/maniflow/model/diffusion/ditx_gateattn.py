@@ -4,6 +4,7 @@
 # References:
 # DiT: https://github.com/facebookresearch/DiT
 # RDT: https://github.com/thu-ml/RoboticsDiffusionTransformer
+# Qwen3: Gate-Attention mechanism
 # --------------------------------------------------------
 
 import re
@@ -14,7 +15,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.vision_transformer import Mlp, RmsNorm
 from maniflow.model.diffusion.positional_embedding import SinusoidalPosEmb
-from maniflow.model.diffusion.ditx_block import DiTXBlock, AdaptiveLayerNorm
+from maniflow.model.diffusion.ditx_block import AdaptiveLayerNorm
+from maniflow.model.diffusion.ditx_gateattn_block import DiTXGateAttnBlock
 from termcolor import cprint
 
 logger = logging.getLogger(__name__)
@@ -37,9 +39,14 @@ class FinalLayer(nn.Module):
         x = self.ffn_final(x)
         return x
     
-class DiTX(nn.Module):
+class DiTXGateAttn(nn.Module):
     """
-    Consistency Flow Training model with a Diffusion Transformer backbone.
+    Consistency Flow Training model with a Diffusion Transformer backbone using Gate-Attention.
+    
+    核心特性：
+    1. 使用 DiTXGateAttnBlock，支持 Gate-Attention 机制（参考Qwen3）
+    2. 支持三种 gate 模式：'none', 'headwise', 'elementwise'
+    3. Flash Attention 2 加速训练和推理
     """
     def __init__(
         self,
@@ -51,7 +58,6 @@ class DiTX(nn.Module):
         visual_cond_len: int = 1024,
         diffusion_timestep_embed_dim: int = 256,
         diffusion_target_t_embed_dim: int = 256,
-        block_type: str = "DiTX",
         n_layer: int = 12,
         n_head: int = 12,
         n_emb: int = 768,
@@ -59,6 +65,7 @@ class DiTX(nn.Module):
         p_drop_attn: float = 0.1,
         qkv_bias: bool = False,
         qk_norm: bool = False,
+        gate_type: str = 'elementwise',  # Gate-Attention类型: 'none', 'headwise', 'elementwise'
         pre_norm_modality: bool = False,
         language_conditioned: bool=False,
         language_model: str = "t5-small",
@@ -68,6 +75,7 @@ class DiTX(nn.Module):
         self.visual_cond_len = visual_cond_len
         self.language_conditioned = language_conditioned
         self.pre_norm_modality = pre_norm_modality
+        self.gate_type = gate_type
         
         # constants
         T = horizon
@@ -125,21 +133,27 @@ class DiTX(nn.Module):
                     dim_cond=n_emb,
                 )
             
-        # Building the transformer blocks
-        self.block_type = block_type
-        if block_type == "DiTX":
-            self.blocks = nn.ModuleList([
-                DiTXBlock(n_emb, n_head, mlp_ratio=mlp_ratio, p_drop_attn=p_drop_attn, 
-                    qkv_bias=qkv_bias, qk_norm=qk_norm) for _ in range(n_layer)
-            ])
-            cprint(f"[DiTX Transformer] Initialized {n_layer} DiTX blocks with hidden size {n_emb}, "
-                    f"num heads {n_head}, mlp ratio {mlp_ratio}, dropout {p_drop_attn}, qkv_bias {qkv_bias}, qk_norm {qk_norm}", "cyan")
+        # Building the transformer blocks with Gate-Attention
+        self.blocks = nn.ModuleList([
+            DiTXGateAttnBlock(
+                hidden_size=n_emb, 
+                num_heads=n_head, 
+                mlp_ratio=mlp_ratio, 
+                gate_type=gate_type,  # Gate-Attention配置
+                p_drop_attn=p_drop_attn, 
+                qkv_bias=qkv_bias, 
+                qk_norm=qk_norm
+            ) for _ in range(n_layer)
+        ])
+        cprint(f"[DiTXGateAttn Transformer] Initialized {n_layer} DiTXGateAttn blocks with hidden size {n_emb}, "
+                f"num heads {n_head}, mlp ratio {mlp_ratio}, dropout {p_drop_attn}, "
+                f"qkv_bias {qkv_bias}, qk_norm {qk_norm}, gate_type {gate_type}", "cyan")
         
         # Final Layer
         self.final_layer = FinalLayer(n_emb, output_dim)
 
         self.initialize_weights()
-        cprint(f"[DiTX Transformer] Initialized weights for DiTX", "green")
+        cprint(f"[DiTXGateAttn Transformer] Initialized weights for DiTXGateAttn", "green")
 
         
         logger.info(
@@ -220,15 +234,36 @@ class DiTX(nn.Module):
         return sentence_embedding
 
     def initialize_weights(self):
+        # DiTXGateAttnBlock 使用 FlashSelfAttention，结构不同，需要适配初始化
         for block in self.blocks:
-            # Initialize self_attn's in_proj_weight and out_proj
-            nn.init.xavier_uniform_(block.self_attn.in_proj_weight)
-            if block.self_attn.in_proj_bias is not None:
-                nn.init.zeros_(block.self_attn.in_proj_bias)
+            # Initialize FlashSelfAttention (qkv projection)
+            if hasattr(block.self_attn, 'qkv'):
+                nn.init.xavier_uniform_(block.self_attn.qkv.weight)
+                if block.self_attn.qkv.bias is not None:
+                    nn.init.zeros_(block.self_attn.qkv.bias)
             
-            nn.init.xavier_uniform_(block.self_attn.out_proj.weight)
-            if block.self_attn.out_proj.bias is not None:
-                nn.init.zeros_(block.self_attn.out_proj.bias)
+            # Initialize self-attention output projection
+            if hasattr(block.self_attn, 'proj'):
+                nn.init.xavier_uniform_(block.self_attn.proj.weight)
+                if block.self_attn.proj.bias is not None:
+                    nn.init.zeros_(block.self_attn.proj.bias)
+            
+            # Initialize CrossAttention (q and kv projections)
+            if hasattr(block.cross_attn, 'q'):
+                nn.init.xavier_uniform_(block.cross_attn.q.weight)
+                if block.cross_attn.q.bias is not None:
+                    nn.init.zeros_(block.cross_attn.q.bias)
+            
+            if hasattr(block.cross_attn, 'kv'):
+                nn.init.xavier_uniform_(block.cross_attn.kv.weight)
+                if block.cross_attn.kv.bias is not None:
+                    nn.init.zeros_(block.cross_attn.kv.bias)
+            
+            # Initialize cross-attention output projection
+            if hasattr(block.cross_attn, 'proj'):
+                nn.init.xavier_uniform_(block.cross_attn.proj.weight)
+                if block.cross_attn.proj.bias is not None:
+                    nn.init.zeros_(block.cross_attn.proj.bias)
 
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -249,7 +284,6 @@ class DiTX(nn.Module):
 
         # Initialize pos emb by normal distribution:
         nn.init.normal_(self.pos_emb, std=0.02)       
-        # nn.init.constant_(self.pos_emb, 0) # not used
         
         # Initialize visual condition pos emb (important for distinguishing different tokens)
         nn.init.normal_(self.vis_cond_pos_embed, std=0.02) 
@@ -370,113 +404,22 @@ class DiTX(nn.Module):
         )
         return optimizer
 
-    # ========= Attention Recording =========
-    def set_record_attn(self, record: bool):
-        """Enable/disable cross-attention weight recording for all blocks"""
-        for block in self.blocks:
-            if hasattr(block, 'set_record_attn'):
-                block.set_record_attn(record)
-    
-    def get_cross_attn_weights(self):
+    # ========= Gate-Attention Statistics =========
+    def get_gate_stats(self):
         """
-        Get cross-attention weights from all blocks.
+        获取所有 blocks 的 Gate-Attention 统计信息（用于wandb记录）
         
         Returns:
-            List of attention weights, one per block.
-            Each weight has shape (B, num_heads, N_action, L_context)
+            dict: 包含所有层的gate统计信息，如果没有任何gate统计则返回None
         """
-        weights = []
-        for block in self.blocks:
-            if hasattr(block, 'get_cross_attn_weights'):
-                w = block.get_cross_attn_weights()
-                if w is not None:
-                    weights.append(w)
-        return weights
-    
-    def get_attn_stats(self, n_obs_steps: int = 2, tokens_per_step: int = 6):
-        """
-        Compute simplified global attention statistics for monitoring.
+        all_stats = {}
+        for i, block in enumerate(self.blocks):
+            block_stats = block.get_gate_stats()
+            if block_stats:
+                for key, value in block_stats.items():
+                    all_stats[f'layer_{i}_{key}'] = value
         
-        Args:
-            n_obs_steps: number of observation time steps (default: 2)
-            tokens_per_step: tokens per time step [head_cam, left_wrist, right_wrist, 
-                            left_tactile, right_tactile, proprio] (default: 6)
-        
-        Returns:
-            dict with global attention statistics (easy to monitor):
-                - entropy: normalized attention entropy (0=focused, 1=uniform)
-                - entropy_early_late_diff: early layers - late layers entropy
-                - modality_rgb: attention ratio on RGB cameras (3 cams)
-                - modality_tactile: attention ratio on tactile (2 sensors)
-                - modality_proprio: attention ratio on proprioception
-                - time_recent: attention ratio on recent time step (t=1)
-        """
-        weights = self.get_cross_attn_weights()
-        if not weights:
-            return None
-        
-        n_layers = len(weights)
-        # Stack all layers: (n_layers, B, num_heads, N_action, L_context)
-        all_weights = torch.stack(weights, dim=0)
-        L_context = all_weights.shape[-1]
-        
-        # === 1. Global Entropy ===
-        # Average over all dimensions except L_context, then compute entropy
-        attn_avg = all_weights.mean(dim=(0, 1, 2, 3))  # (L_context,)
-        entropy = -torch.sum(attn_avg * torch.log(attn_avg + 1e-8))
-        max_entropy = torch.log(torch.tensor(float(L_context), device=attn_avg.device))
-        entropy_normalized = (entropy / max_entropy).item()
-        
-        # === 2. Early vs Late Layers Entropy Diff ===
-        mid = n_layers // 2
-        early_attn = torch.stack(weights[:mid], dim=0).mean(dim=(0, 1, 2, 3))  # (L_context,)
-        late_attn = torch.stack(weights[mid:], dim=0).mean(dim=(0, 1, 2, 3))   # (L_context,)
-        
-        early_entropy = -torch.sum(early_attn * torch.log(early_attn + 1e-8))
-        late_entropy = -torch.sum(late_attn * torch.log(late_attn + 1e-8))
-        entropy_diff = ((early_entropy - late_entropy) / max_entropy).item()
-        
-        # === 3. Modality-level Attention ===
-        # Token structure per time step: [head_cam, left_wrist, right_wrist, left_tactile, right_tactile, proprio]
-        # Indices:                        [0,        1,          2,           3,            4,             5     ]
-        stats = {
-            'entropy': entropy_normalized,
-            'entropy_early_late_diff': entropy_diff,  # positive = early more uniform
-        }
-        
-        # Only compute modality stats if token structure matches expected
-        if L_context == n_obs_steps * tokens_per_step:
-            # Aggregate attention per modality across all time steps
-            rgb_indices = []      # head_cam, left_wrist, right_wrist (indices 0,1,2 per step)
-            tactile_indices = []  # left_tactile, right_tactile (indices 3,4 per step)
-            proprio_indices = []  # proprio (index 5 per step)
-            
-            for t in range(n_obs_steps):
-                base = t * tokens_per_step
-                rgb_indices.extend([base + 0, base + 1, base + 2])
-                tactile_indices.extend([base + 3, base + 4])
-                proprio_indices.append(base + 5)
-            
-            rgb_attn = attn_avg[rgb_indices].sum().item()
-            tactile_attn = attn_avg[tactile_indices].sum().item()
-            proprio_attn = attn_avg[proprio_indices].sum().item()
-            
-            stats['modality_rgb'] = rgb_attn
-            stats['modality_tactile'] = tactile_attn
-            stats['modality_proprio'] = proprio_attn
-            
-            # === 4. Temporal Attention (recent vs old) ===
-            # t=0 is older, t=1 is more recent (assuming n_obs_steps=2)
-            time_attns = []
-            for t in range(n_obs_steps):
-                base = t * tokens_per_step
-                t_attn = attn_avg[base:base + tokens_per_step].sum().item()
-                time_attns.append(t_attn)
-            
-            # Ratio of attention on most recent time step
-            stats['time_recent_ratio'] = time_attns[-1] if n_obs_steps > 0 else 0.0
-        
-        return stats
+        return all_stats if all_stats else None
 
     def forward(self, 
             sample: torch.Tensor, 
@@ -486,7 +429,7 @@ class DiTX(nn.Module):
             lang_cond: Union[torch.Tensor, list, str] = None,
             **kwargs):
         """
-        Forward pass of the DiTX model.
+        Forward pass of the DiTXGateAttn model.
         Input:
             x: (B,T,input_dim)
             timestep: (B,) or int, maniflow time step t
@@ -546,7 +489,7 @@ class DiTX(nn.Module):
             context_c = torch.cat([context_c, lang_c], dim=1) # (B, L + L_lang, n_emb)
 
 
-        # 5. transformer blocks
+        # 5. transformer blocks with Gate-Attention
         for block in self.blocks:
             x = block(x, time_c, context_c) # (B, T, n_emb)
 
@@ -560,15 +503,15 @@ class DiTX(nn.Module):
         return x
 
 if __name__ == "__main__":
-    # Example usage of DiTX model
+    # Example usage of DiTXGateAttn model
     torch.manual_seed(0)  # For reproducibility
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sample = torch.randn(2, 10, 16).to(device)  # Batch size 2, horizon 10, input_dim 16
     timestep = torch.tensor([1, 2]).to(device)  # Example timesteps for each sample in the batch
     target_t = torch.tensor([0.1, 0.2]).to(device)  # Example target_ts for each sample in the batch
-    vis_cond = torch.randn(2, 256, 256).to(device)  # 5 time steps of visual condition
+    vis_cond = torch.randn(2, 256, 256).to(device)  # Visual condition
     lang_cond = ["This is a test sentence.", "Another test sentence."]
-    model = DiTX(
+    model = DiTXGateAttn(
         input_dim=16,
         output_dim=16,
         horizon=10,
@@ -577,18 +520,24 @@ if __name__ == "__main__":
         visual_cond_len=128,
         diffusion_timestep_embed_dim=256,
         diffusion_target_t_embed_dim=256,
-        block_type="DiTX",
         n_layer=2,  # Reduced for testing
         n_head=8,
         n_emb=768,
         mlp_ratio=4.0,
         p_drop_attn=0.1,
+        gate_type='elementwise',  # 测试 elementwise gate
         language_conditioned=True,
         pre_norm_modality=True,
     )
     model = model.to(device)
     output = model(sample, timestep, target_t, vis_cond, lang_cond)
-    print("Output shape:", output.shape)  # Should be (2, 10, 768)
+    print("Output shape:", output.shape)  # Should be (2, 10, 16)
     assert output.shape == (2, 10, 16), "Output shape mismatch!"
+    
+    # Test gate stats
+    gate_stats = model.get_gate_stats()
+    if gate_stats:
+        print("Gate statistics:", gate_stats)
+    
     # Check if the model is initialized correctly
-    logger.info("DiTX model initialized and tested successfully.")
+    logger.info("DiTXGateAttn model initialized and tested successfully.")

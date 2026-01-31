@@ -1,7 +1,7 @@
 defaults:
   - task: demo_task_tactile
 
-name: train_maniflow_modality_moe_tactile_image_timm_policy_accelerate
+name: train_maniflow_modality_moe_tactile_image_timm_policy
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
@@ -60,7 +60,6 @@ policy:
   num_experts_per_tok: 2
   n_shared_experts: 1
   moe_aux_loss_alpha: 0.5  # 🔥 提高到0.5以增强gate梯度 (12层深模型需要更强信号)
-  enable_grad_accumulation: false  # 🔥 使用标准模式 (梯度累积模式有bug)
   gate_type: 'headwise'    # 🔥 Gate-Attention类型: 'none', 'headwise', 'elementwise'（参考Qwen3）
 
   # 🔥 模态嵌入配置
@@ -149,7 +148,6 @@ ema:
   min_value: 0.0
   max_value: 0.9999
 
-# 🔥 Accelerate配置 (触觉MoE可能需要更多内存)
 dataloader:
   batch_size: 32  # 🔥 batch=1可能导致维度问题,改回2
   num_workers: 8  # 🔥 增加workers加速数据加载
@@ -182,10 +180,6 @@ training:
   lr_warmup_steps: 500
   num_epochs: 201
   
-  # 🔥 Accelerate配置
-  use_accelerate: true
-  gradient_accumulate_every: 1  # 🔥 临时改为1，禁用梯度累积以排查问题
-  mixed_precision: "no"  
   use_wandb: true
   
   # 🔥 梯度裁剪配置 (解决MoE梯度爆炸问题)
@@ -205,7 +199,7 @@ logging:
   id: null
   mode: online
   name: ${training.seed}
-  project: ManiFlow_2d_SigLIP_ModalityMoE_Tactile_Accelerate
+  project: ManiFlow_2d_SigLIP_ModalityMoE_Tactile
   resume: true
   tags:
   - ${logging.project}
@@ -215,7 +209,6 @@ logging:
   - tactile_tokens  # 🔥 触觉时间步对齐
   - avg_pooling  # 🔥 RGB平均池化
   - expert_learning  # 🔥 专家自动学习
-  - accelerate
   - triple_camera
 
 checkpoint:

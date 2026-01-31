@@ -7,7 +7,9 @@
 # --------------------------------------------------------
 #
 # 使用说明:
-# 运行测试: python ditx-moe_block.py (需安装依赖: torch, einops, timm)
+# DiTX-MoE Block: 使用Token-level MoE进行特征处理（标准Cross-Attention）
+# 运行测试: python ditx_moe_block.py (需安装依赖: torch, einops, timm)
+# 注意: 此模块不包含Gate-Attention，如需Gate-Attention请使用ditx_gateattn_block.py
 # --------------------------------------------------------
 
 import logging
@@ -157,15 +159,9 @@ class AdaptiveLayerNorm(nn.Module):
 
 class CrossAttention(nn.Module):
     """
-    Cross-attention layer with flash attention and optional gate mechanism.
+    Standard Cross-attention layer with flash attention (no gate mechanism).
     
-    支持两种门控模式（参考Qwen3的gated attention）：
-    - 'none': 无门控（标准cross-attention）
-    - 'headwise': 每个注意力头一个gate值（轻量级）
-    - 'elementwise': 每个元素一个gate值（最细粒度，参考Qwen3）
-    
-    Args:
-        gate_type: 门控类型 ('none', 'headwise', 'elementwise')
+    This is the standard cross-attention for MoE variant.
     """
     fused_attn: Final[bool]
     def __init__(
@@ -177,7 +173,6 @@ class CrossAttention(nn.Module):
             attn_drop: float = 0,
             proj_drop: float = 0,
             norm_layer: nn.Module = nn.LayerNorm,
-            gate_type: str = 'none',  # 🔥 新增：gate-attention类型
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -186,57 +181,23 @@ class CrossAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
         self.use_flash_attn = FLASH_ATTN_AVAILABLE
-        self.gate_type = gate_type
 
-        # 🔥 Query projection with optional gate（参考Qwen3）
-        if gate_type == 'headwise':
-            # 每个头一个gate: q_dim + num_heads
-            self.q = nn.Linear(dim, dim + num_heads, bias=qkv_bias)
-        elif gate_type == 'elementwise':
-            # 每个元素一个gate: q_dim * 2（与Qwen3一致）
-            self.q = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        else:
-            # 标准query
-            self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        
+        # Standard query projection
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        
-        if gate_type != 'none':
-            logger.info(f"[CrossAttention] 🔥 启用Gate-Attention机制: {gate_type}（参考Qwen3）")
     
     def forward(self, x: torch.Tensor, c: torch.Tensor, 
                 mask: None) -> torch.Tensor:
         B, N, C = x.shape
         _, L, _ = c.shape
         
-        # 🔥 Query projection with gate extraction（参考Qwen3实现）
-        q_output = self.q(x)
-        
-        if self.gate_type == 'headwise':
-            # Headwise gate: 每个头一个gate值
-            # q_output: (B, N, dim + num_heads)
-            q_output = q_output.view(B, N, self.num_heads, -1)
-            q, gate_score = torch.split(q_output, [self.head_dim, 1], dim=-1)
-            # gate_score: (B, N, num_heads, 1)
-            q = q.permute(0, 2, 1, 3)  # (B, num_heads, N, head_dim)
-            
-        elif self.gate_type == 'elementwise':
-            # Elementwise gate: 每个元素一个gate值（与Qwen3一致）
-            # q_output: (B, N, dim * 2)
-            q_output = q_output.view(B, N, self.num_heads, -1)
-            q, gate_score = torch.split(q_output, [self.head_dim, self.head_dim], dim=-1)
-            # gate_score: (B, N, num_heads, head_dim)
-            q = q.permute(0, 2, 1, 3)  # (B, num_heads, N, head_dim)
-            
-        else:
-            # 标准模式：无gate
-            q = q_output.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-            gate_score = None
+        # Standard query projection
+        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         
         # Key-Value projection
         kv = self.kv(c).reshape(B, L, 2, self.num_heads, self.head_dim)
@@ -292,30 +253,6 @@ class CrossAttention(nn.Module):
             # attn_output: (B, num_heads, N, head_dim) -> (B, N, num_heads, head_dim)
             attn_output = attn_output.transpose(1, 2)
         
-        # 🔥 Gate-Attention: 用sigmoid(gate)调制attention输出（参考Qwen3）
-        if gate_score is not None:
-            gate_activation = torch.sigmoid(gate_score)
-            attn_output = attn_output * gate_activation
-            
-            # 收集Gate-Attention激活统计（用于wandb监控）
-            if self.training:
-                with torch.no_grad():
-                    # 计算激活值的均值和标准差
-                    gate_mean = gate_activation.mean().item()
-                    gate_std = gate_activation.std().item()
-                    gate_min = gate_activation.min().item()
-                    gate_max = gate_activation.max().item()
-                    
-                    # 存储统计信息（在block的get_moe_stats中访问）
-                    if not hasattr(self, '_gate_stats_buffer'):
-                        self._gate_stats_buffer = []
-                    self._gate_stats_buffer.append({
-                        'mean': gate_mean,
-                        'std': gate_std,
-                        'min': gate_min,
-                        'max': gate_max,
-                    })
-        
         # Reshape and project
         attn_output = attn_output.reshape(B, N, C)
         attn_output = self.proj(attn_output)
@@ -327,13 +264,15 @@ class CrossAttention(nn.Module):
 
 class DiTXMoEBlock(nn.Module):
     """
-    DiTX Block with Token-level Mixture of Experts (MoE) and Gate-Attention.
+    DiTX Block with Token-level Mixture of Experts (MoE) and standard Cross-Attention.
     
     核心改进：
     1. Token级别路由：每个token独立选择专家，细粒度的特征处理
     2. 专家自动学习：自动学习不同模态token的特征处理
     3. AdaLN协调：context_c在进入MoE前通过AdaLN感知时间条件
-    4. Gate-Attention：Cross-attention输出通过可学习的gate调制（参考Qwen3）
+    4. 标准Cross-Attention：不使用Gate-Attention机制
+    
+    注意: 如需Gate-Attention机制，请使用DiTXGateAttnBlock
     
     Args:
         hidden_size: 隐藏层维度
@@ -344,8 +283,6 @@ class DiTXMoEBlock(nn.Module):
         num_experts_per_tok: 每个token激活的专家数
         n_shared_experts: 共享专家数量
         moe_aux_loss_alpha: MoE辅助损失权重
-        enable_grad_accumulation: 是否启用梯度累积友好模式
-        gate_type: Gate-Attention类型 ('none', 'headwise', 'elementwise')
         p_drop_attn: Attention dropout概率
         qkv_bias: 是否使用QKV bias
         qk_norm: 是否对Q和K进行归一化
@@ -356,15 +293,11 @@ class DiTXMoEBlock(nn.Module):
                 mlp_ratio=4.0,
                 
                 # MoE配置
-                use_token_moe=True,           # 🔥 改名：强调token级别
-                num_experts=8,                # Token级MoE建议8-16个专家（比模态级更多）
+                use_token_moe=True,           # 🔥 Token级别MoE
+                num_experts=8,                # Token级MoE建议8-16个专家
                 num_experts_per_tok=2,
                 n_shared_experts=1,
                 moe_aux_loss_alpha=0.01,
-                enable_grad_accumulation=False,  # 🔥 梯度累积支持
-                
-                # Gate-Attention配置
-                gate_type='elementwise',      # 🔥 'none', 'headwise', 'elementwise'
                 
                 # 其他参数
                 p_drop_attn=0.1,
@@ -375,7 +308,6 @@ class DiTXMoEBlock(nn.Module):
         
         self.hidden_size = hidden_size
         self.use_token_moe = use_token_moe
-        self.enable_grad_accumulation = enable_grad_accumulation
 
         # 🚀 Self-Attention with Flash Attention support
         self.self_attn = FlashSelfAttention(
@@ -397,23 +329,19 @@ class DiTXMoEBlock(nn.Module):
                 num_experts_per_tok=num_experts_per_tok,
                 n_shared_experts=n_shared_experts,
                 aux_loss_alpha=moe_aux_loss_alpha,
-                enable_grad_accumulation=enable_grad_accumulation
             )
             # context_c的AdaLN：让MoE输入感知时间条件
             self.context_adaln = AdaptiveLayerNorm(dim=hidden_size, dim_cond=hidden_size)
             logger.info(f"[DiTXMoEBlock] 🔥 Initialized Token-level MoE with {num_experts} experts, "
-                       f"top-{num_experts_per_tok}, {n_shared_experts} shared, "
-                       f"grad_accum={enable_grad_accumulation}")
+                       f"top-{num_experts_per_tok}, {n_shared_experts} shared (standard cross-attention)")
         
-        # Cross-Attention with Gate-Attention
+        # Standard Cross-Attention (without Gate-Attention)
         self.cross_attn = CrossAttention(
             dim=hidden_size, 
             num_heads=num_heads,
             qkv_bias=qkv_bias, 
             qk_norm=qk_norm,
             norm_layer=nn.LayerNorm,
-            gate_type=gate_type,  # 🔥 传递gate-attention配置
-            **block_kwargs
         )
        
         # MLP
@@ -440,8 +368,7 @@ class DiTXMoEBlock(nn.Module):
     
     def reset_moe_accumulation(self):
         """重置MoE的累积统计（在optimizer.step()后调用）"""
-        if self.use_token_moe and self.enable_grad_accumulation:
-            self.token_moe.reset_gate_accumulation()
+        pass  # 保留接口兼容性
     
     def get_moe_stats(self):
         """获取MoE统计信息（用于wandb记录）"""
@@ -474,10 +401,6 @@ class DiTXMoEBlock(nn.Module):
                 stats['topk_weights_mean'] = moe_stats['topk_weights_mean']
             if 'topk_weights_std' in moe_stats:
                 stats['topk_weights_std'] = moe_stats['topk_weights_std']
-        
-        # 3. Gate-Attention激活分布（需要在forward中收集）
-        if hasattr(self, '_gate_activation_stats'):
-            stats.update(self._gate_activation_stats)
         
         return stats if stats else None
         
@@ -520,22 +443,10 @@ class DiTXMoEBlock(nn.Module):
         else:
             context_c_processed = context_c
 
-        # 3. Cross-Attention with adaLN conditioning
+        # 3. Standard Cross-Attention with adaLN conditioning (no Gate-Attention)
         normed_x_cross = modulate(self.norm2(x), shift_cross, scale_cross)
         cross_attn_output = self.cross_attn(normed_x_cross, context_c_processed, mask=None)
         x = x + gate_cross.unsqueeze(1) * cross_attn_output
-        
-        # 收集Gate-Attention统计信息
-        if self.training and hasattr(self.cross_attn, '_gate_stats_buffer') and len(self.cross_attn._gate_stats_buffer) > 0:
-            gate_stats = self.cross_attn._gate_stats_buffer[-1]
-            self._gate_activation_stats = {
-                'gate_activation_mean': gate_stats['mean'],
-                'gate_activation_std': gate_stats['std'],
-                'gate_activation_min': gate_stats['min'],
-                'gate_activation_max': gate_stats['max'],
-            }
-            # 清空buffer
-            self.cross_attn._gate_stats_buffer.clear()
 
         # 4. MLP with adaLN conditioning
         normed_x_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)
@@ -553,7 +464,7 @@ if __name__ == "__main__":
     def test_ditx_moe_block():
         """测试DiTXMoEBlock的基本功能"""
         print("=" * 80)
-        print("测试 DiTXMoEBlock (Token级别MoE + 时间条件感知)")
+        print("测试 DiTXMoEBlock (Token级别MoE + 标准Cross-Attention)")
         print("=" * 80)
         
         # 参数设置
@@ -576,7 +487,7 @@ if __name__ == "__main__":
             'proprio': L_proprio
         }
         
-        # 创建DiTXMoEBlock (Token级MoE + Gate-Attention)
+        # 创建DiTXMoEBlock (Token级MoE + 标准Cross-Attention)
         block_moe = DiTXMoEBlock(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -586,7 +497,6 @@ if __name__ == "__main__":
             num_experts_per_tok=2,
             n_shared_experts=1,
             moe_aux_loss_alpha=0.01,
-            gate_type='headwise',  # 🔥 Gate-Attention（参考Qwen3）
             p_drop_attn=0.1
         )
         
@@ -609,11 +519,11 @@ if __name__ == "__main__":
         print(f"  context_c (多模态): {context_c.shape}")
         print(f"    └─ 头部: {L_head}, 腕部: {L_wrist}, 本体: {L_proprio}")
         
-        # 前向传播 - Token级MoE + Gate-Attention版本
+        # 前向传播 - Token级MoE版本
         print(f"\n" + "─" * 80)
-        print("DiTXMoEBlock 前向传播 (Token级别路由 + Gate-Attention)...")
+        print("DiTXMoEBlock 前向传播 (Token级别路由 + 标准Cross-Attention)...")
         print(f"  🔥 每个token独立选择专家，专家自动学习在不同时间步下关注什么特征")
-        print(f"  🔥 Gate-Attention调制cross-attention输出（参考Qwen3）")
+        print(f"  ⭐ 使用标准Cross-Attention（不含Gate机制）")
         block_moe.train()
         output_moe = block_moe(x, time_c, context_c, modality_lens=modality_lens)
         print(f"  输出形状: {output_moe.shape}")
@@ -657,13 +567,13 @@ if __name__ == "__main__":
             print(f"    ├─ 共享专家: {block_moe.token_moe.n_shared_experts}")
             print(f"    └─ 梯度累积: {block_moe.token_moe.enable_grad_accumulation}")
         
-        # 检查Gate-Attention
+        # 检查Cross-Attention
         if hasattr(block_moe, 'cross_attn'):
             cross_attn_params = sum(p.numel() for p in block_moe.cross_attn.parameters())
             print(f"\n  Cross-Attention参数: {cross_attn_params:,}")
             print(f"    ├─ 注意力头数: {block_moe.cross_attn.num_heads}")
             print(f"    ├─ Head维度: {block_moe.cross_attn.head_dim}")
-            print(f"    └─ Gate类型: {block_moe.cross_attn.gate_type} 🔥")
+            print(f"    └─ 类型: 标准Cross-Attention（无Gate机制）")
         
         print(f"\n" + "=" * 80)
         print("✅ 所有测试通过!")

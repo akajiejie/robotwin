@@ -1,0 +1,230 @@
+defaults:
+  - task: demo_task_tactile
+
+name: train_maniflow_feature_moe_tactile_image_timm_policy_debug
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "debug_feature_moe"
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 16
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: true
+
+policy:
+  _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
+  block_type: "DiTXFeatureMoE"  # 🔥 使用DiTXFeatureMoE (全局特征MoE + 标准DiTX)
+  
+  # 🔥 简化架构：降低学习难度（用于debug验证）
+  n_layer: 12        # 🔥 4层足够验证
+  n_head: 8
+  n_emb: 768
+  
+  # 🔥 视觉条件长度配置 (output_token_sequence=true + avg模式)
+  # TimmMultimodalEncoder + output_token_sequence=true + feature_aggregation='avg' 输出:
+  #   ✅ RGB相机 (SigLIP vit_base_patch16_224):
+  #     - avg模式: 所有patches平均池化为1个token per image
+  #     - head_cam: 1相机 × 2时间步 × 1 token = 2 tokens
+  #     - left_wrist_cam: 1相机 × 2时间步 × 1 token = 2 tokens
+  #     - right_wrist_cam: 1相机 × 2时间步 × 1 token = 2 tokens
+  #   
+  #   ✅ 触觉传感器 (ResNet18 + GlobalAvgPool):
+  #     - 触觉图经过ResNet18提取特征，GlobalAvgPool聚合为1个token per image
+  #     - left_tactile: 1传感器 × 2时间步 × 1 token = 2 tokens
+  #     - right_tactile: 1传感器 × 2时间步 × 1 token = 2 tokens
+  #   
+  #   ✅ 本体感知:
+  #     - agent_pos投影后: 2时间步 = 2 tokens
+  #   
+  #   总计: visual_cond_len = 2 + 2 + 2 + 2 + 2 + 2 = 12 tokens
+  visual_cond_len: 12  # 🔥 head(2) + left_wrist(2) + right_wrist(2) + left_tactile(2) + right_tactile(2) + proprio(2)
+  
+  max_lang_cond_len: 1024
+  qkv_bias: true
+  qk_norm: true
+  language_conditioned: false
+  pre_norm_modality: false
+
+  # 🔥 全局特征MoE配置 (DiTXFeatureMoE特有参数)
+  # 核心设计:
+  # 1. 在encoder和DiTX blocks之间插入全局MoE模块
+  # 2. MoE对所有context特征（视觉+本体感知）进行全局预处理
+  # 3. 帮助模型训练收敛，专家学习不同的特征转换模式
+  # 4. DiTX blocks使用标准架构，不改动原有结构
+  use_feature_moe: true           # 🔥 启用全局特征MoE
+  feature_moe_num_experts: 8      # 🔥 4个专家（debug验证）
+  feature_moe_experts_per_tok: 2  # 🔥 每个token选择2个专家
+  feature_moe_shared_experts: 1   # 🔥 1个共享专家
+  feature_moe_aux_loss_alpha: 0.1 # 🔥 负载均衡辅助损失权重
+
+  # 🔥 Token级MoE配置 (DiTXFeatureMoE不使用，保持默认)
+  # use_token_moe: false            # 🔥 DiTXFeatureMoE使用全局特征MoE，不使用token级MoE
+  # num_experts: 4
+  # num_experts_per_tok: 2
+  # n_shared_experts: 1
+  # moe_aux_loss_alpha: 0.5
+  # gate_type: 'none'               # 🔥 DiTXFeatureMoE不使用gate-attention
+
+  # 🔥 模态嵌入配置（DiTXFeatureMoE不使用模态嵌入，由全局MoE自动学习）
+  use_modality_embedding: false
+  head_cond_len: 2
+  wrist_cond_len: 8
+
+  flow_batch_ratio: 0.75 
+  consistency_batch_ratio: 0.25
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete" 
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  obs_encoder:
+    _target_: maniflow.model.vision_2d.timm_multimodal_encoder.TimmMultimodalEncoder
+    shape_meta: ${shape_meta}
+    
+    ##### RGB相机配置 (SigLIP) #####
+    model_name: 'vit_base_patch16_siglip_224'
+    pretrained: true
+    frozen: flase              # 🔥 冻结RGB编码器
+    global_pool: ''
+    feature_aggregation: 'avg'
+    downsample_ratio: 32
+    
+    ##### 触觉传感器配置 #####
+    tactile_model_name: 'resnet18'
+    tactile_pretrained: false
+    tactile_frozen: false      # 🔥 冻结触觉编码器
+    tactile_feature_dim: 768
+    share_tactile_model: true
+    tactile_output_all_patches: true
+    
+    ##### 🔥 输出token序列模式 #####
+    output_token_sequence: true
+    
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees: [-5.0, 5.0]
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+     
+    use_group_norm: false
+    share_rgb_model: false
+    imagenet_norm: true
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64      
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 2
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4           # 🔥 适中的学习率
+  betas: [0.9, 0.95]
+  eps: 1.0e-8 
+  weight_decay: 1.0e-3
+
+training:
+  device: "cuda:0"
+  env_device: "cuda:0"
+  seed: 42
+  debug: True             # 🔥 开启debug模式
+  resume: False           # 🔥 从头开始训练
+  lr_scheduler: cosine
+  lr_warmup_steps: 100    # 🔥 减少warmup步数（debug）
+  num_epochs: 50          # 🔥 减少epoch数（debug验证）
+  
+  gradient_accumulate_every: 1
+  use_wandb: true
+  
+  max_grad_norm: 5.0      # 🔥 梯度裁剪
+  
+  use_ema: True  
+  rollout_every: 100
+  checkpoint_every: 25    # 🔥 更频繁保存checkpoint（debug）
+  val_every: 10           # 🔥 更频繁验证（debug）
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${training.seed}
+  project: ManiFlow_DEBUG_FeatureMoE
+  resume: false
+  tags:
+  - ${logging.project}
+  - feature_moe           # 🔥 全局特征MoE
+  - ditx_standard         # 🔥 标准DiTX blocks
+  - debug_validation      # 🔥 验证实验
+  - global_moe            # 🔥 全局MoE预处理
+  - tactile_tokens
+  - avg_pooling
+
+checkpoint:
+  save_ckpt: True
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 1
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  
+  save_last_ckpt: True
+  save_last_snapshot: False
+  save_every: 25
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+checkpoint_num: 500
+expert_data_num: 50
+raw_task_name: none
+setting: none
+
