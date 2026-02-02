@@ -13,6 +13,17 @@ from maniflow.model.vision_2d.timm_obs_encoder import TimmObsEncoder
 from maniflow.model.diffusion.ditx import DiTX
 from maniflow.model.common.sample_util import *
 
+# Optional import for Gate-Attention support
+try:
+    from maniflow.model.diffusion.ditx_gateattn import DiTXGateAttn
+    GATE_ATTN_AVAILABLE = True
+except ImportError:
+    GATE_ATTN_AVAILABLE = False
+    DiTXGateAttn = None
+    cprint("[Warning] DiTXGateAttn not available, falling back to DiTX", "yellow")
+
+
+
 class ManiFlowTransformerImagePolicy(BasePolicy):
     def __init__(self, 
              shape_meta: dict,
@@ -29,7 +40,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             n_emb=256,
             qkv_bias=False,
             qk_norm=False,
-            block_type="DiTX",
+            # Gate-Attention configuration
+            use_gate_attn=False,  # 是否使用Gate-Attention（DiTXGateAttn）
+            gate_type='elementwise',  # Gate-Attention类型: 'none', 'headwise', 'elementwise'
+            block_type='DiTX',  # 保留此参数以保持向后兼容
             obs_encoder: TimmObsEncoder = None,
             language_conditioned=False,
             # consistency flow training parameters
@@ -64,28 +78,53 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             input_dim = action_dim
             global_cond_dim = obs_feature_dim
         
-        # 创建DiTX模型
-        cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTX模型", "cyan")
-        model = DiTX(
-            input_dim=input_dim,
-            output_dim=action_dim,
-            horizon=horizon,
-            n_obs_steps=n_obs_steps,
-            cond_dim=global_cond_dim,
-            visual_cond_len=visual_cond_len,
-            diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
-            diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
-            n_layer=n_layer,
-            n_head=n_head,
-            n_emb=n_emb,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_norm,
-            block_type=block_type,
-            language_conditioned=language_conditioned,
-        )
+        # 根据use_gate_attn选择模型类型
+        if use_gate_attn:
+            if not GATE_ATTN_AVAILABLE:
+                raise ImportError(
+                    "DiTXGateAttn is not available. Please check if ditx_gateattn.py is properly installed."
+                )
+            cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTXGateAttn模型 (gate_type={gate_type})", "cyan")
+            model = DiTXGateAttn(
+                input_dim=input_dim,
+                output_dim=action_dim,
+                horizon=horizon,
+                n_obs_steps=n_obs_steps,
+                cond_dim=global_cond_dim,
+                visual_cond_len=visual_cond_len,
+                diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
+                diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
+                n_layer=n_layer,
+                n_head=n_head,
+                n_emb=n_emb,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                gate_type=gate_type,  # Gate-Attention配置
+                language_conditioned=language_conditioned,
+            )
+        else:
+            cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTX模型 (标准版)", "cyan")
+            model = DiTX(
+                input_dim=input_dim,
+                output_dim=action_dim,
+                horizon=horizon,
+                n_obs_steps=n_obs_steps,
+                cond_dim=global_cond_dim,
+                visual_cond_len=visual_cond_len,
+                diffusion_timestep_embed_dim=diffusion_timestep_embed_dim,
+                diffusion_target_t_embed_dim=diffusion_target_t_embed_dim,
+                n_layer=n_layer,
+                n_head=n_head,
+                n_emb=n_emb,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                language_conditioned=language_conditioned,
+            )
         
         self.obs_encoder = obs_encoder
         self.model = model
+        self.use_gate_attn = use_gate_attn
+        self.gate_type = gate_type
         
         self.normalizer = LinearNormalizer()
         self.horizon = horizon
@@ -109,6 +148,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         assert self.sample_target_t_mode in ["absolute", "relative"], "sample_target_t_mode must be either 'absolute' or 'relative'"
         
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
+        cprint(f"  - model_type: {'DiTXGateAttn' if self.use_gate_attn else 'DiTX'}", "yellow")
+        if self.use_gate_attn:
+            cprint(f"  - gate_type: {self.gate_type}", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
         cprint(f"  - n_action_steps: {self.n_action_steps}", "yellow")
         cprint(f"  - n_obs_steps: {self.n_obs_steps}", "yellow")
@@ -129,10 +171,32 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         if hasattr(self.model, 'set_record_attn'):
             self.model.set_record_attn(record)
     
-    def get_attn_stats(self):
-        """Get attention statistics from DiTX model"""
+    def get_attn_stats(self, modality_info: dict = None):
+        """
+        Get attention statistics from DiTX model
+        
+        Args:
+            modality_info: 模态信息字典，来自encoder.get_modality_info()
+        """
         if hasattr(self.model, 'get_attn_stats'):
-            return self.model.get_attn_stats()
+            return self.model.get_attn_stats(modality_info=modality_info)
+        return None
+    
+    def get_gate_stats(self):
+        """
+        Get Gate-Attention statistics from DiTXGateAttn model
+        
+        Returns:
+            dict: Global gate statistics including:
+                - gate/mean_activation: Average gate activation across all layers
+                - gate/saturation_high_ratio: Ratio of highly saturated gates (>0.9)
+                - gate/saturation_low_ratio: Ratio of low saturated gates (<0.1)
+                - gate/layer_variance: Variance of gate activations across layers
+                - gate/modality_{modality}_mean: Per-modality gate values
+                - gate/early_vs_late_diff: Difference between early and late layers
+        """
+        if hasattr(self.model, 'get_gate_stats'):
+            return self.model.get_gate_stats()
         return None
         
     # ========= inference  ============
@@ -190,6 +254,11 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].to(device))
         nobs_features = self.obs_encoder(this_nobs).to(device)
         
+        # 获取模态信息（用于gate bias初始化）
+        modality_info = None
+        if hasattr(self.obs_encoder, 'get_modality_info'):
+            modality_info = self.obs_encoder.get_modality_info()
+        
         # 支持token序列输出模式
         if hasattr(self.obs_encoder, 'output_token_sequence') and self.obs_encoder.output_token_sequence:
             # Token序列模式: (B, L_tokens, D)
@@ -202,11 +271,15 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
 
         # run sampling
+        kwargs_with_modality = {**self.kwargs}
+        if modality_info is not None:
+            kwargs_with_modality['modality_info'] = modality_info
+        
         nsample = self.conditional_sample(
             cond_data, 
             vis_cond=vis_cond,
             lang_cond=lang_cond,
-            **self.kwargs)
+            **kwargs_with_modality)
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
@@ -381,6 +454,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         vis_cond = model_kwargs.get('vis_cond', None)
         lang_cond = model_kwargs.get('lang_cond', None)
         ema_model = model_kwargs.get('ema_model', None)
+        modality_info = model_kwargs.get('modality_info', None)
         consistency_batchsize = actions.shape[0]
         device = actions.device
 
@@ -420,6 +494,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 target_t=target_t_next.squeeze(), 
                 vis_cond=vis_cond[-consistency_batchsize:],
                 lang_cond=lang_cond[-consistency_batchsize:] if lang_cond is not None else None,
+                modality_info=modality_info,
             ) 
         # predict the target data point using the average velocity
         pred_x1_ct = x_t_next + (1 - t_next) * v_avg_to_next_target
@@ -487,6 +562,11 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             lambda x: x[:,:self.n_obs_steps,...].to(self.device))
         nobs_features = self.obs_encoder(this_nobs)
         
+        # 获取模态信息（用于gate bias初始化）
+        modality_info = None
+        if hasattr(self.obs_encoder, 'get_modality_info'):
+            modality_info = self.obs_encoder.get_modality_info()
+        
         # 支持token序列输出模式
         if hasattr(self.obs_encoder, 'output_token_sequence') and self.obs_encoder.output_token_sequence:
             vis_cond = nobs_features  # 已经是 (B, L_tokens, D) 格式
@@ -507,21 +587,24 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             timestep=flow_target_dict['t'].squeeze(),
             target_t=flow_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[:flow_batchsize],
-            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None)
+            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
+            modality_info=modality_info)
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
         # Get consistency targets
         consistency_target_dict = self.get_consistency_velocity(nactions[flow_batchsize:flow_batchsize+consistency_batchsize],
                                                                         vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
                                                                         lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-                                                                        ema_model=ema_model
+                                                                        ema_model=ema_model,
+                                                                        modality_info=modality_info
                                                                         )
         v_ct_pred = self.model(
             sample=consistency_target_dict['x_t'], 
             timestep=consistency_target_dict['t'].squeeze(),
             target_t=consistency_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-            lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None)
+            lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+            modality_info=modality_info)
         v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
 
         """Compute losses"""
@@ -542,6 +625,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         loss_ct = loss_ct.mean().item()  
 
         loss = loss.mean()
+        
+        # Get gate statistics if available (for Gate-Attention models)
+        gate_stats = self.get_gate_stats()
+        
         loss_dict = {
                 'loss_flow': loss_flow,
                 'loss_ct': loss_ct,
@@ -549,5 +636,16 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),
         }
+        
+        # Add gate statistics to loss_dict if available
+        if gate_stats:
+            loss_dict.update(gate_stats)
+            
+            # Add correlation metrics between loss and gate activations
+            # This helps understand if certain modalities are more important for reducing loss
+            if 'gate/modality_tactile_mean' in gate_stats:
+                loss_dict['correlation/loss_vs_tactile_gate'] = loss_flow * gate_stats['gate/modality_tactile_mean']
+            if 'gate/modality_proprio_mean' in gate_stats:
+                loss_dict['correlation/loss_vs_proprio_gate'] = loss_flow * gate_stats['gate/modality_proprio_mean']
 
         return loss, loss_dict

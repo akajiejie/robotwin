@@ -314,19 +314,25 @@ class TrainManiFlowRoboTwinWorkspace:
                                     sample_batch = dict_apply(batch, lambda x: x[:4].to(device))  # Use small batch
                                     _ = self.model.compute_loss(sample_batch, self.ema_model)
                                 
+                                # 🔥 获取模态信息（用于正确解析token位置）
+                                modality_info = None
+                                if hasattr(self.model.obs_encoder, 'get_modality_info'):
+                                    modality_info = self.model.obs_encoder.get_modality_info()
+                                
                                 # Get simplified global attention statistics
-                                attn_stats = self.model.get_attn_stats()
+                                attn_stats = self.model.get_attn_stats(modality_info=modality_info)
                                 if attn_stats is not None:
                                     # Core metrics (always available)
                                     step_log['attn/entropy'] = attn_stats['entropy']
                                     step_log['attn/entropy_diff'] = attn_stats['entropy_early_late_diff']
                                     
-                                    # Modality attention (if token structure matches)
+                                    # Modality attention (if modality_info is available)
                                     if 'modality_rgb' in attn_stats:
                                         step_log['attn/modality_rgb'] = attn_stats['modality_rgb']
+                                        step_log['attn/modality_head'] = attn_stats.get('modality_head', 0.0)
+                                        step_log['attn/modality_wrist'] = attn_stats.get('modality_wrist', 0.0)
                                         step_log['attn/modality_tactile'] = attn_stats['modality_tactile']
                                         step_log['attn/modality_proprio'] = attn_stats['modality_proprio']
-                                        step_log['attn/time_recent'] = attn_stats['time_recent_ratio']
                                 
                                 # Disable attention recording
                                 self.model.set_record_attn(False)

@@ -321,6 +321,16 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
                 nn.init.zeros_(self.proprio_proj.bias)
                 cprint(f"  ✓ 本体感知投影层: {total_low_dim} -> {rgb_feature_dim}", 'green')
         
+        # 🔥 模态Drop配置（用于训练时的数据增强）
+        # 设计理念：模拟真实机器人操作中的传感器失效场景
+        self.modality_drop_config = {
+            'head': 0.0,        # Head相机drop概率（模拟遮挡）
+            'rgb_wrist': 0.0,   # Wrist相机drop概率（近距离视角）
+            'tactile': 0.0,     # Tactile drop概率（接触信息）
+            'proprio': 0.0,     # Proprio drop概率（本体感知）
+        }
+        cprint(f"✓ 模态Drop配置已初始化（默认关闭）", 'cyan')
+        
         logger.info(f"多模态编码器参数量: {sum(p.numel() for p in self.parameters()):,}")
     
     def _init_rgb_aggregation(self, feature_aggregation, feature_dim, feature_map_shape, 
@@ -559,11 +569,17 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         """
         🆕 输出token序列格式: (B, L_tokens, D)
         
-        模态组织策略（各模态独立输出）:
-        - head: head_cam tokens (如果有)
-        - wrist: left_wrist_cam + right_wrist_cam + left_tactile + right_tactile tokens
-                (各自独立输出，不做融合，MoE可以学习模态间关系)
-        - proprio: agent_pos tokens (投影到RGB特征维度)
+        模态组织策略（各模态独立输出，支持模态Drop）:
+        - head: head_cam tokens (可被Drop，模拟遮挡场景)
+        - rgb_wrist: left_wrist_cam + right_wrist_cam tokens (低Drop率，近距离视角重要)
+        - tactile: left_tactile + right_tactile tokens (极低Drop率，接触信息关键)
+        - proprio: agent_pos tokens (可被Drop，强制学习视觉-触觉依赖)
+        
+        Drop策略设计理念:
+        - Head相机: 在实际操作中容易被机械臂遮挡 → 高Drop率模拟遮挡
+        - Wrist相机: 近距离视角，不易遮挡 → 低Drop率
+        - Tactile: 接触时的关键信息 → 极低/不Drop
+        - Proprio: 可能存在编码器噪声 → 中等Drop率
         
         Args:
             obs_dict: 观测字典
@@ -573,7 +589,8 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             result: (B, L_tokens, D) token序列
         """
         head_tokens_list = []
-        wrist_tokens_list = []
+        rgb_wrist_tokens_list = []  # 🔥 RGB相机tokens（分离出来）
+        tactile_tokens_list = []     # 🔥 触觉tokens（分离出来）
         proprio_features_list = []
         
         # 获取时间步数（从任意观测中获取）
@@ -598,7 +615,8 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             if is_head_cam:
                 head_tokens_list.append(token_seq)
             else:
-                wrist_tokens_list.append(token_seq)
+                # 🔥 分离RGB wrist相机
+                rgb_wrist_tokens_list.append(token_seq)
         
         # ============ 处理触觉传感器 ============
         if self.tactile_encoder is not None and len(self.tactile_keys) > 0:
@@ -618,7 +636,7 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
                     # 🔥 触觉编码器保留时序维度，直接使用
                     # output_all_patches=True: (B, T*H*W, D) - 保留所有时间步的所有patch
                     # output_all_patches=False: (B, T, D) - 保留所有时间步，每个时间步1个token
-                    wrist_tokens_list.append(tact_tok)
+                    tactile_tokens_list.append(tact_tok)
         
         # ============ 处理低维状态（本体感知） ============
         for key in self.low_dim_keys:
@@ -627,26 +645,40 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             assert B == batch_size
             proprio_features_list.append(data)  # (B, T, low_dim)
         
-        # ============ 组装最终的token序列 ============
+        # ============ 组装最终的token序列（应用模态Drop） ============
         all_tokens = []
-        modality_info = {'head': 0, 'wrist': 0, 'proprio': 0}
+        modality_info = {'head': 0, 'rgb_wrist': 0, 'tactile': 0, 'proprio': 0}
         
-        # Head tokens
+        # 🔥 Head tokens (高Drop率 - 模拟被机械臂遮挡的场景)
+        # 实际操作中，头部相机经常被机械臂遮挡，模型需要学会在遮挡时依赖腕部相机和触觉
         if head_tokens_list:
             head_tokens = torch.cat(head_tokens_list, dim=1)  # (B, n_head_cams*T, D)
+            head_tokens = self._apply_modality_drop(head_tokens, 'head')
             all_tokens.append(head_tokens)
             modality_info['head'] = head_tokens.shape[1]
         
-        # Wrist tokens (包含融合后的触觉信息)
-        if wrist_tokens_list:
-            wrist_tokens = torch.cat(wrist_tokens_list, dim=1)  # (B, n_wrist_cams*T, D)
-            all_tokens.append(wrist_tokens)
-            modality_info['wrist'] = wrist_tokens.shape[1]
+        # 🔥 RGB Wrist tokens (低Drop率 - 近距离视角，不易遮挡)
+        # 腕部相机贴近操作物体，提供关键的近距离视觉信息
+        if rgb_wrist_tokens_list:
+            rgb_wrist_tokens = torch.cat(rgb_wrist_tokens_list, dim=1)  # (B, n_wrist_cams*T, D)
+            rgb_wrist_tokens = self._apply_modality_drop(rgb_wrist_tokens, 'rgb_wrist')
+            all_tokens.append(rgb_wrist_tokens)
+            modality_info['rgb_wrist'] = rgb_wrist_tokens.shape[1]
         
-        # Proprio tokens (投影到RGB特征维度)
+        # 🔥 Tactile tokens (极低Drop率 - 接触信息是兜底保障)
+        # 触觉传感器提供直接接触信息，是视觉失效时的关键信息源
+        if tactile_tokens_list:
+            tactile_tokens = torch.cat(tactile_tokens_list, dim=1)  # (B, n_tactile*T, D)
+            tactile_tokens = self._apply_modality_drop(tactile_tokens, 'tactile')
+            all_tokens.append(tactile_tokens)
+            modality_info['tactile'] = tactile_tokens.shape[1]
+        
+        # 🔥 Proprio tokens (中等Drop率 - 强制学习视觉-触觉依赖)
+        # 本体感知可能存在编码器噪声，Drop后强制模型从视觉和触觉推断位置
         if proprio_features_list:
             proprio_concat = torch.cat(proprio_features_list, dim=-1)  # (B, T, total_low_dim)
             proprio_tokens = self.proprio_proj(proprio_concat.float())  # (B, T, D)
+            proprio_tokens = self._apply_modality_drop(proprio_tokens, 'proprio')
             all_tokens.append(proprio_tokens)
             modality_info['proprio'] = proprio_tokens.shape[1]
         
@@ -665,6 +697,89 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             modality_info: dict {'head': L_head, 'wrist': L_wrist, 'proprio': L_proprio}
         """
         return getattr(self, '_last_modality_info', None)
+    
+    def set_modality_drop_config(self, head_drop=0.0, rgb_wrist_drop=0.0, tactile_drop=0.0, proprio_drop=0.0):
+        """
+        🔥 设置模态Drop概率
+        
+        设计理念：模拟真实机器人操作中的传感器失效场景
+        - Head相机: 容易被机械臂遮挡 → 建议高Drop率 (0.2-0.3)
+        - Wrist相机: 近距离视角，不易遮挡 → 建议低Drop率 (0.05-0.1)
+        - Tactile: 接触信息关键 → 建议极低/不Drop (0.0-0.02)
+        - Proprio: 可能有编码器噪声 → 建议中等Drop率 (0.1-0.15)
+        
+        Args:
+            head_drop: Head相机的drop概率 (0.0-1.0)
+            rgb_wrist_drop: Wrist相机的drop概率 (0.0-1.0)
+            tactile_drop: Tactile传感器的drop概率 (0.0-1.0)
+            proprio_drop: Proprio的drop概率 (0.0-1.0)
+        """
+        self.modality_drop_config = {
+            'head': head_drop,
+            'rgb_wrist': rgb_wrist_drop,
+            'tactile': tactile_drop,
+            'proprio': proprio_drop,
+        }
+        cprint(f"✓ 模态Drop配置已更新: head={head_drop}, rgb_wrist={rgb_wrist_drop}, "
+               f"tactile={tactile_drop}, proprio={proprio_drop}", 'yellow')
+    
+    def _apply_modality_drop(self, tokens, modality_name):
+        """
+        🔥 对指定模态的tokens应用Drop（仅训练时）
+        
+        机制说明:
+        - 训练时: 以指定概率将整个batch中的某些样本的该模态tokens全部置零
+        - 推理时: 自动关闭（通过self.training判断）
+        - 梯度流动: 置零的tokens仍然参与反向传播，梯度会流向未被Drop的模态
+        
+        Args:
+            tokens: (B, L, D) 模态的token序列
+            modality_name: 'proprio', 'rgb', 'tactile'
+        
+        Returns:
+            tokens: Drop后的token序列（推理时返回原始tokens）
+        """
+        # 🔥 关键：只在训练模式下才Drop
+        if not self.training:
+            return tokens
+        
+        drop_prob = self.modality_drop_config.get(modality_name, 0.0)
+        if drop_prob == 0.0:
+            return tokens
+        
+        # 生成Drop mask（每个batch样本独立决定是否Drop）
+        B = tokens.shape[0]
+        # drop_mask: (B, 1, 1) - 对每个样本独立采样，广播到所有tokens和特征维度
+        drop_mask = torch.bernoulli(
+            torch.full((B, 1, 1), 1.0 - drop_prob, device=tokens.device, dtype=tokens.dtype)
+        )
+        
+        # 应用mask（置零但保留梯度流动）
+        tokens_dropped = tokens * drop_mask
+        
+        # 统计Drop信息（用于调试）
+        if not hasattr(self, '_drop_stats'):
+            self._drop_stats = {}
+        dropped_samples = (drop_mask.squeeze() == 0).sum().item()
+        self._drop_stats[modality_name] = {
+            'dropped_samples': dropped_samples,
+            'total_samples': B,
+            'drop_rate': dropped_samples / B if B > 0 else 0.0
+        }
+        
+        return tokens_dropped
+    
+    def get_drop_stats(self):
+        """
+        获取最近一次forward的Drop统计信息
+        
+        Returns:
+            drop_stats: dict {modality_name: {'dropped_samples': int, 'total_samples': int, 'drop_rate': float}}
+        """
+        stats = getattr(self, '_drop_stats', {})
+        # 清空统计信息
+        self._drop_stats = {}
+        return stats if stats else None
     
     @torch.no_grad()
     def output_shape(self):

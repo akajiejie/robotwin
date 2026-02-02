@@ -84,12 +84,13 @@ class TimmTactileEncoder(BaseSensoryEncoder):
         else:
             raise NotImplementedError(f"Unsupported model: {model_name}")
         
-        if use_group_norm and not pretrained:
+        #use group norm to replace batch norm
+        if use_group_norm:
             backbone = replace_submodules(
                 root_module=backbone,
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(
-                    num_groups=max(1, x.num_features // 16),
+                    num_groups=max(1, x.num_features // 16), 
                     num_channels=x.num_features
                 )
             )
@@ -98,6 +99,8 @@ class TimmTactileEncoder(BaseSensoryEncoder):
             conv_proj = nn.Conv2d(512, feature_dim, kernel_size=1)
             return nn.Sequential(backbone, conv_proj)
         else:
+            # 🔥 使用改进的SpatialSoftmax（参考robomimic）
+            # SpatialSoftmax输出: (B, 512) -> (B, 512*2) = (B, 1024)
             spatial_softmax = SpatialSoftmax(temperature=1.0)
             projection = nn.Linear(512 * 2, feature_dim)
             return nn.Sequential(backbone, spatial_softmax, projection)
@@ -121,15 +124,21 @@ class TimmTactileEncoder(BaseSensoryEncoder):
                 B = tactile_data.shape[0]
                 T = 1
             
-            if tactile_data.max() > 1.0:
+            # 🔥 修复：归一化时保持梯度连接
+            # 使用条件归一化，确保梯度能够反向传播
+            # 注意：不能用 with torch.no_grad() 包裹归一化操作本身
+            with torch.no_grad():
+                max_val = tactile_data.max().item()
+            
+            if max_val > 1.0:
+                # 关键：这个除法操作必须在梯度计算图中
                 tactile_data = tactile_data / 255.0
             
             expected_shape = self.key_shape_map[key]
-            if tactile_data.shape[1:] != expected_shape:
-                target_H, target_W = expected_shape[1], expected_shape[2]
-                tactile_data = F.interpolate(
+            if tactile_data.shape[-2] < 64:
+                 tactile_data = F.interpolate(
                     tactile_data, 
-                    size=(target_H, target_W), 
+                    size=(64, 128),  # 强制放大
                     mode='bilinear', 
                     align_corners=False
                 )
@@ -152,7 +161,12 @@ class TimmTactileEncoder(BaseSensoryEncoder):
 
 
 class SpatialSoftmax(nn.Module):
-    """Spatial Softmax池化层，输出特征点的(x,y)坐标加权和"""
+    """
+    Spatial Softmax池化层（参考robomimic实现）
+    
+    输出每个通道的期望坐标(x,y)，可以保留空间信息同时降维
+    关键改进：确保梯度能够正确反向传播到输入特征图
+    """
     
     def __init__(self, temperature=1.0, normalize=False):
         super().__init__()
@@ -160,23 +174,45 @@ class SpatialSoftmax(nn.Module):
         self.normalize = normalize
     
     def forward(self, x):
+        """
+        Args:
+            x: (B, C, H, W) 特征图
+        Returns:
+            output: (B, C*2) 每个通道的(x,y)坐标
+        """
         B, C, H, W = x.shape
         
-        pos_x = torch.linspace(-1, 1, W, device=x.device)
-        pos_y = torch.linspace(-1, 1, H, device=x.device)
-        pos_x, pos_y = torch.meshgrid(pos_x, pos_y, indexing='xy')
-        pos_x = pos_x.reshape(1, 1, H * W)
-        pos_y = pos_y.reshape(1, 1, H * W)
+        # 创建归一化的坐标网格 [-1, 1]
+        # 🔥 修复：确保坐标网格正确创建且不断开梯度
+        pos_x = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype)
+        pos_y = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype)
+        # 使用 meshgrid 创建坐标网格，注意输出顺序
+        pos_y, pos_x = torch.meshgrid(pos_y, pos_x, indexing='ij')  # (H, W)
         
-        x_flat = x.reshape(B, C, H * W)
+        # Reshape for broadcasting: (1, 1, H, W)
+        pos_x = pos_x.reshape(1, 1, H, W)
+        pos_y = pos_y.reshape(1, 1, H, W)
         
+        # Flatten spatial dimensions: (B, C, H*W)
+        x_flat = x.reshape(B, C, -1)
+        
+        # 数值稳定性：减去最大值（可选）
         if self.normalize:
             x_flat = x_flat - x_flat.max(dim=-1, keepdim=True)[0]
+        
+        # 计算softmax权重: (B, C, H*W)
+        # 🔥 关键：确保temperature参与计算图
         weights = F.softmax(x_flat / self.temperature, dim=-1)
         
-        expected_x = (weights * pos_x).sum(dim=-1)
-        expected_y = (weights * pos_y).sum(dim=-1)
+        # Reshape weights for spatial operations: (B, C, H, W)
+        weights = weights.reshape(B, C, H, W)
         
+        # 计算期望坐标（加权平均）
+        # 🔥 这里的乘法和求和操作都是可微的
+        expected_x = (weights * pos_x).sum(dim=[2, 3])  # (B, C)
+        expected_y = (weights * pos_y).sum(dim=[2, 3])  # (B, C)
+        
+        # 拼接x和y坐标: (B, C*2)
         output = torch.cat([expected_x, expected_y], dim=-1)
         
         return output
@@ -226,15 +262,80 @@ if __name__ == '__main__':
     print(f"输出: {list(out.values())[0].shape} -> 期望: [B=4, T=2, D=768]")
     assert list(out.values())[0].shape == (4, 2, 768), "输出形状不匹配！"
     
-    # 测试梯度
+    print("\n=== 梯度测试 ===")
+    encoder.train()
+    encoder.zero_grad()
+    
     obs_grad = {
         'left_tactile': torch.randn(2, 2, 1, 16, 32, requires_grad=True),
         'right_tactile': torch.randn(2, 2, 1, 16, 32, requires_grad=True),
     }
-    output = encoder(obs_grad)
     
+    intermediate_outputs = {}
+    hooks = []
+    
+    def save_grad_hook(name):
+        def hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                intermediate_outputs[f'{name}_grad_out'] = grad_output[0].norm().item()
+            if grad_input[0] is not None:
+                intermediate_outputs[f'{name}_grad_in'] = grad_input[0].norm().item()
+        return hook
+    
+    model = encoder.key_model_map['left_tactile']
+    for i, module in enumerate(model):
+        hook = module.register_full_backward_hook(save_grad_hook(f'module_{i}_{module.__class__.__name__}'))
+        hooks.append(hook)
+    
+    output = encoder(obs_grad)
     loss = sum(v.sum() for v in output.values())
     loss.backward()
     
-    print(f"梯度范数: {obs_grad['left_tactile'].grad.norm().item():.6f}")
-    print("\n✅ 测试通过\n")
+    for hook in hooks:
+        hook.remove()
+    
+    left_grad_norm = obs_grad['left_tactile'].grad.norm().item()
+    right_grad_norm = obs_grad['right_tactile'].grad.norm().item()
+    
+    print(f"\n输入梯度:")
+    print(f"  left_tactile: {left_grad_norm:.6f}")
+    print(f"  right_tactile: {right_grad_norm:.6f}")
+    
+    assert left_grad_norm > 0, "left_tactile梯度为0"
+    assert right_grad_norm > 0, "right_tactile梯度为0"
+    assert not torch.isnan(obs_grad['left_tactile'].grad).any(), "梯度包含NaN"
+    
+    print(f"\n中间层梯度流:")
+    for name in sorted(intermediate_outputs.keys()):
+        print(f"  {name}: {intermediate_outputs[name]:.6f}")
+    
+    param_grads = []
+    for name, param in encoder.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            param_grads.append((name, grad_norm))
+    
+    print(f"\n模型参数梯度:")
+    print(f"  有梯度参数: {len(param_grads)}/{sum(1 for p in encoder.parameters())}")
+    if param_grads:
+        avg_grad = sum(g for _, g in param_grads) / len(param_grads)
+        max_grad = max(param_grads, key=lambda x: x[1])
+        min_grad = min(param_grads, key=lambda x: x[1])
+        print(f"  平均梯度: {avg_grad:.6f}")
+        print(f"  最大梯度: {max_grad[0]} = {max_grad[1]:.6f}")
+        print(f"  最小梯度: {min_grad[0]} = {min_grad[1]:.6f}")
+    
+    spatial_softmax_found = False
+    for name, module in encoder.key_model_map['left_tactile'].named_modules():
+        if isinstance(module, SpatialSoftmax):
+            spatial_softmax_found = True
+            break
+    
+    print(f"\nSpatialSoftmax检查:")
+    print(f"  模块存在: {spatial_softmax_found}")
+    if 'module_1_SpatialSoftmax_grad_in' in intermediate_outputs:
+        print(f"  输入梯度: {intermediate_outputs['module_1_SpatialSoftmax_grad_in']:.6f}")
+    if 'module_1_SpatialSoftmax_grad_out' in intermediate_outputs:
+        print(f"  输出梯度: {intermediate_outputs['module_1_SpatialSoftmax_grad_out']:.6f}")
+    
+    print("\n✅ 梯度测试通过\n")

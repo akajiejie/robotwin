@@ -1,13 +1,12 @@
 defaults:
-  - task: demo_task_image
+  - task: demo_task_tactile
 
-name: train_maniflow_image_timm_policy
-
+name: train_maniflow_tactile_image_policy_gateattn
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "debug"
+exp_name: "flow_tactile_image_gateattn"
 
-horizon: 64
+horizon: 32
 n_obs_steps: 2
 n_action_steps: 32
 n_latency_steps: 0
@@ -17,73 +16,90 @@ obs_as_global_cond: true
 
 policy:
   _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
-  block_type: "DiTX"
-  n_layer: 12  # max 28
-  n_head: 8  # max 16
-  n_emb: 768 # max 1152
-  visual_cond_len: 1024 # max 1024
-  max_lang_cond_len: 1024 # maximum length of language tokens
+  
+  # Gate-Attention 配置
+  use_gate_attn: true       # 启用 Gate-Attention 机制（使用DiTXGateAttn）
+  gate_type: "elementwise"  # Gate-Attention类型: 'none', 'headwise', 'elementwise'
+                            # - 'none': 标准cross-attention（无gate）
+                            # - 'headwise': 每个注意力头一个gate值（轻量级）
+                            # - 'elementwise': 每个元素一个gate值（最细粒度，参考Qwen3）
+  block_type: "DiTX"        # 保留此参数以保持向后兼容性
+  
+  # 架构配置
+  n_layer: 12
+  n_head: 8
+  n_emb: 768
+  
+  # TimmMultimodalEncoder 输出 (每时间步):
+  #   - head_cam: 1 token
+  #   - left_wrist_cam: 1 token
+  #   - right_wrist_cam: 1 token
+  #   - left_tactile: 1 token
+  #   - right_tactile: 1 token
+  #   - proprio: 1 token
+  # 每时间步: 6 tokens, 总计: 6 × n_obs_steps(2) = 12 tokens
+  visual_cond_len: 6
+  
+  max_lang_cond_len: 1024
   qkv_bias: true
   qk_norm: true
-
   language_conditioned: false
   pre_norm_modality: false
 
   flow_batch_ratio: 0.75 
   consistency_batch_ratio: 0.25
-
-  sample_t_mode_flow: "beta" # choose between beta or lognorm, both are performing well
+  sample_t_mode_flow: "beta"
   sample_t_mode_consistency: "discrete" 
   sample_dt_mode_consistency: "uniform"
-  sample_target_t_mode: "relative" # "absolute", "relative"
+  sample_target_t_mode: "relative"
   denoise_timesteps: 10
-
   diffusion_timestep_embed_dim: 128
   diffusion_target_t_embed_dim: 128
-
   horizon: ${horizon}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
-
   num_inference_steps: 10
   obs_as_global_cond: true
   shape_meta: ${shape_meta}
 
   obs_encoder:
-    _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
+    _target_: maniflow.model.vision_2d.timm_multimodal_encoder.TimmMultimodalEncoder
     shape_meta: ${shape_meta}
-
-    ##### SigLIP models from timm #####
-    model_name: 'vit_base_patch16_siglip_224'  # SigLIP Base 86M parameters
-    # model_name: 'vit_large_patch16_siglip_256'  # SigLIP Large 
-    # model_name: 'vit_so400m_patch14_siglip_224'  # SigLIP So400M
+    
+    ##### RGB相机配置 (SigLIP) #####
+    model_name: 'vit_base_patch16_siglip_224'
     pretrained: true
     frozen: false
-
     global_pool: ''
-
-    # SigLIP doesn't have CLS token, uses mean pooling over all patch tokens
-    feature_aggregation: 'avg'  # 'avg' or null both use mean pooling for SigLIP
-
-    downsample_ratio: 32  # Not applicable for SigLIP but kept for compatibility
-
+    feature_aggregation: 'avg'  # 使用avg聚合，每个相机输出1个token
+    downsample_ratio: 32
+    
+    ##### 触觉传感器配置 #####
+    tactile_model_name: 'resnet18'
+    tactile_pretrained: false
+    tactile_frozen: false
+    tactile_feature_dim: 768   #与RGB特征维度一致
+    share_tactile_model: true
+    tactile_output_all_patches: false  #改为false，每个触觉传感器每时间步输出1个token
+    
+    #####输出token序列模式 #####
+    output_token_sequence: true
+    
     transforms:
       - type: RandomCrop
         ratio: 0.95
       - _target_: torchvision.transforms.RandomRotation
-        degrees:
-          - -5.0
-          - 5.0
+        degrees: [-5.0, 5.0]
         expand: false
       - _target_: torchvision.transforms.ColorJitter
         brightness: 0.3
         contrast: 0.4
         saturation: 0.5
-        hue: 0.1
+        hue: 0.08
      
-    use_group_norm: false  # Not applicable for SigLIP
+    use_group_norm: false
     share_rgb_model: false
-    imagenet_norm: true  # SigLIP uses ImageNet normalization
+    imagenet_norm: true
 
 ema:
   _target_: maniflow.model.diffusion.ema_model.EMAModel
@@ -94,14 +110,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64  # Can use larger batch size with 86M model
-  num_workers: 4
+  batch_size: 112      
+  num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
-  batch_size: 64
+  batch_size: 112
   num_workers: 4
   shuffle: False
   pin_memory: True
@@ -109,7 +125,7 @@ val_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 5.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 1.0e-3
@@ -122,11 +138,13 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 151
+  num_epochs: 301
   gradient_accumulate_every: 1
-  use_ema: True
+  use_wandb: true
+  max_grad_norm: 5.0
+  use_ema: True  
   rollout_every: 100
-  checkpoint_every: 100
+  checkpoint_every: 50
   val_every: 50
   sample_every: 5
   max_train_steps: null
@@ -138,11 +156,14 @@ logging:
   id: null
   mode: online
   name: ${training.seed}
-  project: ManiFlow_2d_SigLIP
-  resume: true
+  project: ManiFlow_Tactile_Image_GateAttn
+  resume: false
   tags:
   - ${logging.project}
-  - timm_siglip_86m
+  - ditx_gateattn
+  - gate_attention
+  - tactile_rgb
+  - elementwise_gate
 
 checkpoint:
   save_ckpt: True

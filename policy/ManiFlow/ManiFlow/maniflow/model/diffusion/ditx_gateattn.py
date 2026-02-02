@@ -10,6 +10,7 @@
 import re
 import logging
 from typing import Union, Tuple
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -155,6 +156,8 @@ class DiTXGateAttn(nn.Module):
         self.initialize_weights()
         cprint(f"[DiTXGateAttn Transformer] Initialized weights for DiTXGateAttn", "green")
 
+        # Gate bias初始化标志
+        self._gate_bias_initialized = False
         
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
@@ -233,6 +236,18 @@ class DiTXGateAttn(nn.Module):
 
         return sentence_embedding
 
+    def _initialize_gate_bias(self, modality_info: dict):
+        """
+        为所有block初始化gate bias
+        
+        Args:
+            modality_info: 来自encoder.get_modality_info(), 例如 {'head': 100, 'tactile': 4, 'proprio': 16}
+        """
+        for i, block in enumerate(self.blocks):
+            if hasattr(block, 'set_modality_ranges'):
+                block.set_modality_ranges(modality_info)
+        # logger.info(f"[DiTXGateAttn] Gate bias已初始化，模态信息: {modality_info}")
+    
     def initialize_weights(self):
         # DiTXGateAttnBlock 使用 FlashSelfAttention，结构不同，需要适配初始化
         for block in self.blocks:
@@ -407,19 +422,206 @@ class DiTXGateAttn(nn.Module):
     # ========= Gate-Attention Statistics =========
     def get_gate_stats(self):
         """
-        获取所有 blocks 的 Gate-Attention 统计信息（用于wandb记录）
+        获取所有 blocks 的 Gate-Attention 全局统计信息（用于wandb记录）
         
         Returns:
-            dict: 包含所有层的gate统计信息，如果没有任何gate统计则返回None
+            dict: 包含以下全局指标：
+                - gate/mean_activation: 所有层的平均门控激活值
+                - gate/std_activation: 所有层门控激活的标准差
+                - gate/saturation_high_ratio: 高饱和度比例 (>0.9)
+                - gate/saturation_low_ratio: 低饱和度比例 (<0.1)
+                - gate/layer_variance: 层间门控激活的方差（衡量层间差异）
+                - gate/modality_{modality}_mean: 各模态的平均门控值
+                - gate/early_vs_late: 早期层(前1/3)与后期层(后1/3)的门控差异
         """
-        all_stats = {}
+        if self.gate_type == 'none':
+            return None
+        
+        all_layer_stats = []
+        modality_stats = {}
+        
+        # 收集所有层的统计信息
         for i, block in enumerate(self.blocks):
             block_stats = block.get_gate_stats()
             if block_stats:
+                all_layer_stats.append({
+                    'layer_idx': i,
+                    'mean': block_stats.get('gate_activation_mean', 0),
+                    'std': block_stats.get('gate_activation_std', 0),
+                    'saturation_high': block_stats.get('gate_saturation_high', 0),
+                    'saturation_low': block_stats.get('gate_saturation_low', 0),
+                })
+                
+                # 收集模态统计
                 for key, value in block_stats.items():
-                    all_stats[f'layer_{i}_{key}'] = value
+                    if key.startswith('modality_gate_'):
+                        modality = key.replace('modality_gate_', '')
+                        if modality not in modality_stats:
+                            modality_stats[modality] = []
+                        modality_stats[modality].append(value)
         
-        return all_stats if all_stats else None
+        if not all_layer_stats:
+            return None
+        
+        # 计算全局统计指标
+        global_stats = {}
+        
+        # 1. 全局平均门控激活
+        mean_activations = [s['mean'] for s in all_layer_stats]
+        global_stats['gate/mean_activation'] = np.mean(mean_activations)
+        global_stats['gate/std_activation'] = np.mean([s['std'] for s in all_layer_stats])
+        
+        # 2. 饱和度统计
+        global_stats['gate/saturation_high_ratio'] = np.mean([s['saturation_high'] for s in all_layer_stats])
+        global_stats['gate/saturation_low_ratio'] = np.mean([s['saturation_low'] for s in all_layer_stats])
+        
+        # 3. 层间方差（衡量不同层的门控差异）
+        global_stats['gate/layer_variance'] = np.var(mean_activations)
+        
+        # 4. 早期层 vs 后期层对比
+        n_layers = len(all_layer_stats)
+        early_third = n_layers // 3
+        late_third = 2 * n_layers // 3
+        
+        early_mean = np.mean([s['mean'] for s in all_layer_stats[:early_third]]) if early_third > 0 else 0
+        late_mean = np.mean([s['mean'] for s in all_layer_stats[late_third:]]) if late_third < n_layers else 0
+        global_stats['gate/early_vs_late_diff'] = late_mean - early_mean
+        global_stats['gate/early_layers_mean'] = early_mean
+        global_stats['gate/late_layers_mean'] = late_mean
+        
+        # 5. 模态特定的门控值
+        for modality, values in modality_stats.items():
+            global_stats[f'gate/modality_{modality}_mean'] = np.mean(values)
+            global_stats[f'gate/modality_{modality}_std'] = np.std(values)
+        
+        return global_stats
+    
+    # ========= Attention Weight Recording =========
+    def set_record_attn(self, record: bool):
+        """Enable/disable cross-attention weight recording for all blocks"""
+        for block in self.blocks:
+            if hasattr(block, 'set_record_attn'):
+                block.set_record_attn(record)
+    
+    def get_cross_attn_weights(self):
+        """
+        Get cross-attention weights from all blocks.
+        
+        Returns:
+            List of attention weights, one per block.
+            Each weight has shape (B, num_heads, N_action, L_context)
+        """
+        weights = []
+        for block in self.blocks:
+            if hasattr(block, 'get_cross_attn_weights'):
+                w = block.get_cross_attn_weights()
+                if w is not None:
+                    weights.append(w)
+        return weights
+    
+    def get_attn_stats(self, modality_info: dict = None):
+        """
+        Compute simplified global attention statistics for monitoring.
+        
+        🔥 重要: 此方法需要从encoder获取modality_info来正确解析token位置
+        
+        Args:
+            modality_info: 模态信息字典，来自encoder.get_modality_info()
+                          例如: {'head': 2, 'rgb_wrist': 4, 'tactile': 4, 'proprio': 2}
+                          表示各模态的token数量
+        
+        Returns:
+            dict with global attention statistics (easy to monitor):
+                - entropy: normalized attention entropy (0=focused, 1=uniform)
+                - entropy_early_late_diff: early layers - late layers entropy
+                - modality_rgb: attention ratio on RGB cameras (head + wrist)
+                - modality_tactile: attention ratio on tactile sensors
+                - modality_proprio: attention ratio on proprioception
+                - modality_head: attention ratio on head camera (详细)
+                - modality_wrist: attention ratio on wrist cameras (详细)
+        """
+        weights = self.get_cross_attn_weights()
+        if not weights:
+            return None
+        
+        n_layers = len(weights)
+        # Stack all layers: (n_layers, B, num_heads, N_action, L_context)
+        all_weights = torch.stack(weights, dim=0)
+        L_context = all_weights.shape[-1]
+        
+        # === 1. Global Entropy ===
+        # Average over all dimensions except L_context, then compute entropy
+        attn_avg = all_weights.mean(dim=(0, 1, 2, 3))  # (L_context,)
+        entropy = -torch.sum(attn_avg * torch.log(attn_avg + 1e-8))
+        max_entropy = torch.log(torch.tensor(float(L_context), device=attn_avg.device))
+        entropy_normalized = (entropy / max_entropy).item()
+        
+        # === 2. Early vs Late Layers Entropy Diff ===
+        mid = n_layers // 2
+        early_attn = torch.stack(weights[:mid], dim=0).mean(dim=(0, 1, 2, 3))  # (L_context,)
+        late_attn = torch.stack(weights[mid:], dim=0).mean(dim=(0, 1, 2, 3))   # (L_context,)
+        
+        early_entropy = -torch.sum(early_attn * torch.log(early_attn + 1e-8))
+        late_entropy = -torch.sum(late_attn * torch.log(late_attn + 1e-8))
+        entropy_diff = ((early_entropy - late_entropy) / max_entropy).item()
+        
+        stats = {
+            'entropy': entropy_normalized,
+            'entropy_early_late_diff': entropy_diff,  # positive = early more uniform
+        }
+        
+        # === 3. Modality-level Attention (使用实际的token组织) ===
+        if modality_info is not None:
+            # 🔥 Token组织方式（来自TimmMultimodalEncoder._forward_token_sequence）:
+            # [head tokens, rgb_wrist tokens, tactile tokens, proprio tokens]
+            # 例如: [head×2, wrist×4, tactile×4, proprio×2] = 12 tokens
+            
+            start_idx = 0
+            head_attn = 0.0
+            wrist_attn = 0.0
+            tactile_attn = 0.0
+            proprio_attn = 0.0
+            
+            # Head相机
+            if 'head' in modality_info and modality_info['head'] > 0:
+                n_head = modality_info['head']
+                head_attn = attn_avg[start_idx:start_idx + n_head].sum().item()
+                start_idx += n_head
+            
+            # Wrist相机 (RGB)
+            if 'rgb_wrist' in modality_info and modality_info['rgb_wrist'] > 0:
+                n_wrist = modality_info['rgb_wrist']
+                wrist_attn = attn_avg[start_idx:start_idx + n_wrist].sum().item()
+                start_idx += n_wrist
+            
+            # 触觉传感器
+            if 'tactile' in modality_info and modality_info['tactile'] > 0:
+                n_tactile = modality_info['tactile']
+                tactile_attn = attn_avg[start_idx:start_idx + n_tactile].sum().item()
+                start_idx += n_tactile
+            
+            # 本体感知
+            if 'proprio' in modality_info and modality_info['proprio'] > 0:
+                n_proprio = modality_info['proprio']
+                proprio_attn = attn_avg[start_idx:start_idx + n_proprio].sum().item()
+                start_idx += n_proprio
+            
+            # 聚合RGB = head + wrist
+            rgb_attn = head_attn + wrist_attn
+            
+            # 保存统计信息
+            stats['modality_rgb'] = rgb_attn
+            stats['modality_head'] = head_attn
+            stats['modality_wrist'] = wrist_attn
+            stats['modality_tactile'] = tactile_attn
+            stats['modality_proprio'] = proprio_attn
+            
+            # 验证总和约为1.0
+            total_attn = rgb_attn + tactile_attn + proprio_attn
+            if abs(total_attn - 1.0) > 0.01:
+                logger.warning(f"注意力总和偏离1.0: {total_attn:.4f}")
+        
+        return stats
 
     def forward(self, 
             sample: torch.Tensor, 
@@ -488,6 +690,13 @@ class DiTXGateAttn(nn.Module):
                 lang_c = self.lang_norm(lang_c, time_c)
             context_c = torch.cat([context_c, lang_c], dim=1) # (B, L + L_lang, n_emb)
 
+
+        # 首次前向传播时自动初始化gate bias
+        if not self._gate_bias_initialized and self.gate_type != 'none':
+            modality_info = kwargs.get('modality_info', None)
+            if modality_info is not None:
+                self._initialize_gate_bias(modality_info)
+                self._gate_bias_initialized = True
 
         # 5. transformer blocks with Gate-Attention
         for block in self.blocks:

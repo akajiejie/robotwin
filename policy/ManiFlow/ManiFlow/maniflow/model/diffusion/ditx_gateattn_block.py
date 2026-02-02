@@ -172,8 +172,54 @@ class CrossAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         
-        if gate_type != 'none':
-            logger.info(f"[CrossAttention] 启用Gate-Attention机制: {gate_type}（参考Qwen3）")
+        # 用于存储模态特定的gate bias
+        self.register_buffer('_modality_bias_tensor', None, persistent=False)
+        
+        # 用于记录注意力权重（用于分析）
+        self._record_attn = False
+        self._last_attn_weights = None
+        
+        # if gate_type != 'none':
+        #     logger.info(f"[CrossAttention] 启用Gate-Attention机制: {gate_type}（参考Qwen3）")
+    
+    def set_modality_gate_bias(self, modality_ranges: dict, modality_bias_config: dict):
+        """
+        为不同模态的token设置gate bias
+        
+        Args:
+            modality_ranges: 每个模态的token范围, 例如 {'head': (0, 100), 'tactile': (104, 108)}
+            modality_bias_config: 每个模态的bias值（logit空间）, 例如 {'tactile': 0.5, 'proprio': -0.5}
+        """
+        if self.gate_type == 'none':
+            return
+        
+        N_total = max(end for _, end in modality_ranges.values())
+        
+        if self.gate_type == 'headwise':
+            gate_dim = self.num_heads
+        elif self.gate_type == 'elementwise':
+            gate_dim = self.num_heads * self.head_dim
+        else:
+            return
+        
+        bias_tensor = torch.zeros(1, N_total, gate_dim)
+        
+        for modality, (start_idx, end_idx) in modality_ranges.items():
+            bias_value = modality_bias_config.get(modality, 0.0)
+            bias_tensor[:, start_idx:end_idx, :] = bias_value
+        
+        self._modality_bias_tensor = bias_tensor.to(next(self.parameters()).device)
+        # logger.info(f"[CrossAttention] Gate Bias已设置: {modality_bias_config}")
+    
+    def set_record_attn(self, record: bool):
+        """Enable/disable attention weight recording"""
+        self._record_attn = record
+        if not record:
+            self._last_attn_weights = None
+    
+    def get_cross_attn_weights(self):
+        """Get recorded cross-attention weights"""
+        return self._last_attn_weights
     
     def forward(self, x: torch.Tensor, c: torch.Tensor, 
                 mask: None) -> torch.Tensor:
@@ -182,6 +228,18 @@ class CrossAttention(nn.Module):
         
         # Query projection with gate extraction（参考Qwen3实现）
         q_output = self.q(x)
+        
+        # 动态添加模态特定的gate bias
+        if self.gate_type != 'none' and self._modality_bias_tensor is not None:
+            N_current = x.shape[1]
+            if N_current <= self._modality_bias_tensor.shape[1]:
+                bias = self._modality_bias_tensor[:, :N_current, :].to(q_output.device)
+                
+                if self.gate_type == 'headwise':
+                    q_output[..., -self.num_heads:] = q_output[..., -self.num_heads:] + bias
+                elif self.gate_type == 'elementwise':
+                    gate_start = self.num_heads * self.head_dim
+                    q_output[..., gate_start:] = q_output[..., gate_start:] + bias
         
         if self.gate_type == 'headwise':
             # Headwise gate: 每个头一个gate值
@@ -209,7 +267,8 @@ class CrossAttention(nn.Module):
         k, v = kv.unbind(2)  # k, v: (B, L, num_heads, head_dim)
         
         # Flash Attention 路径
-        if self.use_flash_attn and x.is_cuda and x.dtype in [torch.float16, torch.bfloat16] and mask is None:
+        attn_weights_for_recording = None
+        if self.use_flash_attn and x.is_cuda and x.dtype in [torch.float16, torch.bfloat16] and mask is None and not self._record_attn:
             # Flash Attention 需要 (B, N, num_heads, head_dim) 格式
             # q 当前是 (B, num_heads, N, head_dim)，需要转换
             q = q.transpose(1, 2)  # (B, N, num_heads, head_dim)
@@ -223,7 +282,7 @@ class CrossAttention(nn.Module):
             # attn_output: (B, N, num_heads, head_dim)
             
         else:
-            # PyTorch SDPA 后端
+            # PyTorch SDPA 后端（或需要记录注意力权重时）
             # 转换 k, v 到 (B, num_heads, L, head_dim)
             k = k.permute(0, 2, 1, 3)
             v = v.permute(0, 2, 1, 3)
@@ -237,7 +296,7 @@ class CrossAttention(nn.Module):
                 mask = mask.expand(-1, -1, N, -1)
             
             # Attention computation
-            if self.fused_attn:
+            if self.fused_attn and not self._record_attn:
                 attn_output = F.scaled_dot_product_attention(
                     query=q,
                     key=k,
@@ -246,17 +305,27 @@ class CrossAttention(nn.Module):
                     attn_mask=mask
                 )
             else:
+                # 手动计算注意力（用于记录权重）
                 q = q * self.scale
-                attn = q @ k.transpose(-2, -1)
+                attn = q @ k.transpose(-2, -1)  # (B, num_heads, N, L)
                 if mask is not None:
                     attn = attn.masked_fill_(mask.logical_not(), float('-inf'))
                 attn = attn.softmax(dim=-1)
+                
+                # 记录注意力权重
+                if self._record_attn:
+                    attn_weights_for_recording = attn.detach()
+                
                 if self.attn_drop.p > 0:
                     attn = self.attn_drop(attn)
                 attn_output = attn @ v
             
             # attn_output: (B, num_heads, N, head_dim) -> (B, N, num_heads, head_dim)
             attn_output = attn_output.transpose(1, 2)
+        
+        # 存储注意力权重
+        if self._record_attn and attn_weights_for_recording is not None:
+            self._last_attn_weights = attn_weights_for_recording
         
         # Gate-Attention: 用sigmoid(gate)调制attention输出（参考Qwen3）
         if gate_score is not None:
@@ -269,8 +338,19 @@ class CrossAttention(nn.Module):
                     # 计算激活值的均值和标准差
                     gate_mean = gate_activation.mean().item()
                     gate_std = gate_activation.std().item()
-                    gate_min = gate_activation.min().item()
-                    gate_max = gate_activation.max().item()
+                    
+                    # 饱和度统计：高激活(>0.9)和低激活(<0.1)的比例
+                    gate_high_saturation = (gate_activation > 0.9).float().mean().item()
+                    gate_low_saturation = (gate_activation < 0.1).float().mean().item()
+                    
+                    # 模态特定的门控值（如果设置了模态bias）
+                    modality_gates = {}
+                    if self._modality_bias_tensor is not None:
+                        N_current = gate_activation.shape[1]
+                        if N_current <= self._modality_bias_tensor.shape[1]:
+                            # 计算每个模态的平均门控激活
+                            # 需要从parent block获取模态范围信息
+                            pass  # 将在block层面计算
                     
                     # 存储统计信息（在block的get_gate_stats中访问）
                     if not hasattr(self, '_gate_stats_buffer'):
@@ -278,8 +358,9 @@ class CrossAttention(nn.Module):
                     self._gate_stats_buffer.append({
                         'mean': gate_mean,
                         'std': gate_std,
-                        'min': gate_min,
-                        'max': gate_max,
+                        'saturation_high': gate_high_saturation,
+                        'saturation_low': gate_low_saturation,
+                        'modality_gates': modality_gates,
                     })
         
         # Reshape and project
@@ -329,6 +410,18 @@ class DiTXGateAttnBlock(nn.Module):
         
         self.hidden_size = hidden_size
         self.gate_type = gate_type
+        
+        # 模态特定的Gate Bias配置
+        # 设计理念：让模型从"信任触觉"开始训练
+        # tactile: +0.5 -> sigmoid(0.5) = 0.62 (高初始权重)
+        # proprio: -0.5 -> sigmoid(-0.5) = 0.38 (低初始权重)
+        # head/rgb_wrist: 0.0 -> sigmoid(0.0) = 0.5 (中性)
+        self.modality_bias_config = {
+            'tactile': 0.5,
+            'proprio': -0.5,
+            'head': 0.0,
+            'rgb_wrist': 0.0,
+        }
 
         # Self-Attention with Flash Attention support
         self.self_attn = FlashSelfAttention(
@@ -374,10 +467,51 @@ class DiTXGateAttnBlock(nn.Module):
             nn.Linear(hidden_size, modulation_size, bias=True)
         )
         
-        logger.info(f"[DiTXGateAttnBlock] Initialized with Gate-Attention: {gate_type}")
+        # logger.info(f"[DiTXGateAttnBlock] Initialized with Gate-Attention: {gate_type}")
+    
+    def set_modality_ranges(self, modality_info: dict):
+        """
+        设置模态token范围，并初始化gate bias
+        
+        Args:
+            modality_info: 来自encoder.get_modality_info(), 例如 {'head': 100, 'tactile': 4, 'proprio': 16}
+        """
+        if self.gate_type == 'none':
+            return
+        
+        ranges = {}
+        start = 0
+        for modality in ['head', 'rgb_wrist', 'tactile', 'proprio']:
+            if modality in modality_info and modality_info[modality] > 0:
+                num_tokens = modality_info[modality]
+                ranges[modality] = (start, start + num_tokens)
+                start += num_tokens
+        
+        self.cross_attn.set_modality_gate_bias(ranges, self.modality_bias_config)
+        # logger.info(f"[DiTXGateAttnBlock] 模态范围已设置: {ranges}")
+    
+    def update_modality_bias_config(self, **kwargs):
+        """
+        动态更新模态bias配置
+        
+        Example:
+            block.update_modality_bias_config(tactile=1.0, proprio=-1.0)
+        """
+        self.modality_bias_config.update(kwargs)
+        # logger.info(f"[DiTXGateAttnBlock] Gate Bias配置已更新: {self.modality_bias_config}")
     
     def get_gate_stats(self):
-        """获取Gate-Attention统计信息（用于wandb记录）"""
+        """
+        获取Gate-Attention统计信息（用于wandb记录）
+        
+        Returns:
+            dict: 包含以下全局统计指标：
+                - gate_activation_mean: 门控激活均值
+                - gate_activation_std: 门控激活标准差
+                - gate_saturation_high: 高饱和度比例 (>0.9)
+                - gate_saturation_low: 低饱和度比例 (<0.1)
+                - modality_gate_values: 各模态的平均门控值（如果可用）
+        """
         stats = {}
         
         # Gate-Attention激活分布
@@ -385,12 +519,33 @@ class DiTXGateAttnBlock(nn.Module):
             gate_stats = self.cross_attn._gate_stats_buffer[-1]
             stats['gate_activation_mean'] = gate_stats['mean']
             stats['gate_activation_std'] = gate_stats['std']
-            stats['gate_activation_min'] = gate_stats['min']
-            stats['gate_activation_max'] = gate_stats['max']
+            
+            # 饱和度统计（高激活和低激活的比例）
+            if 'saturation_high' in gate_stats:
+                stats['gate_saturation_high'] = gate_stats['saturation_high']
+            if 'saturation_low' in gate_stats:
+                stats['gate_saturation_low'] = gate_stats['saturation_low']
+            
+            # 模态特定的门控值
+            if 'modality_gates' in gate_stats:
+                for modality, value in gate_stats['modality_gates'].items():
+                    stats[f'modality_gate_{modality}'] = value
+            
             # 清空buffer
             self.cross_attn._gate_stats_buffer.clear()
         
         return stats if stats else None
+    
+    def set_record_attn(self, record: bool):
+        """Enable/disable cross-attention weight recording"""
+        if hasattr(self.cross_attn, 'set_record_attn'):
+            self.cross_attn.set_record_attn(record)
+    
+    def get_cross_attn_weights(self):
+        """Get recorded cross-attention weights from this block"""
+        if hasattr(self.cross_attn, 'get_cross_attn_weights'):
+            return self.cross_attn.get_cross_attn_weights()
+        return None
         
     def forward(self, x, time_c, context_c, attn_mask=None):
         """
