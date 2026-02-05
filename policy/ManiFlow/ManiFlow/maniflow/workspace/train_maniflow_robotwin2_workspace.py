@@ -175,6 +175,35 @@ class TrainManiFlowRoboTwinWorkspace:
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
+        
+        # 🔥 配置模态Drop（如果启用）
+        if cfg.training.get('modality_drop', {}).get('enabled', False):
+            drop_config = cfg.training.modality_drop
+            head_drop = drop_config.get('head_drop', 0.0)
+            rgb_wrist_drop = drop_config.get('rgb_wrist_drop', 0.0)
+            tactile_drop = drop_config.get('tactile_drop', 0.0)
+            proprio_drop = drop_config.get('proprio_drop', 0.0)
+            
+            # 为policy的obs_encoder设置modality drop
+            if hasattr(self.model, 'obs_encoder') and hasattr(self.model.obs_encoder, 'set_modality_drop_config'):
+                self.model.obs_encoder.set_modality_drop_config(
+                    head_drop=head_drop,
+                    rgb_wrist_drop=rgb_wrist_drop,
+                    tactile_drop=tactile_drop,
+                    proprio_drop=proprio_drop
+                )
+                cprint(f"✓ 模态Drop已启用: head={head_drop}, rgb_wrist={rgb_wrist_drop}, "
+                       f"tactile={tactile_drop}, proprio={proprio_drop}", 'yellow')
+            
+            # 为ema_model的obs_encoder也设置（如果使用EMA）
+            if cfg.training.use_ema and hasattr(self.ema_model, 'obs_encoder') and \
+               hasattr(self.ema_model.obs_encoder, 'set_modality_drop_config'):
+                self.ema_model.obs_encoder.set_modality_drop_config(
+                    head_drop=head_drop,
+                    rgb_wrist_drop=rgb_wrist_drop,
+                    tactile_drop=tactile_drop,
+                    proprio_drop=proprio_drop
+                )
 
         # configure lr scheduler
         lr_scheduler = get_scheduler(
@@ -300,6 +329,14 @@ class TrainManiFlowRoboTwinWorkspace:
                     }
                     t1_5 = time.time()
                     step_log.update(loss_dict)
+                    
+                    # 🔥 记录模态Drop统计（如果启用）
+                    if cfg.training.get('modality_drop', {}).get('enabled', False):
+                        if hasattr(self.model, 'obs_encoder') and hasattr(self.model.obs_encoder, 'get_drop_stats'):
+                            drop_stats = self.model.obs_encoder.get_drop_stats()
+                            if drop_stats:
+                                for modality, stats in drop_stats.items():
+                                    step_log[f'drop/{modality}_rate'] = stats['drop_rate']
                     
                     # ========== Attention Weight Recording ==========
                     # Record attention statistics periodically (every 500 steps)

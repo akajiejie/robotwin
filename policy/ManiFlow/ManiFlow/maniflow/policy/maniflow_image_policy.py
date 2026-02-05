@@ -162,8 +162,50 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         cprint(f"  - sample_t_mode_consistency: {self.sample_t_mode_consistency}", "yellow")
         cprint(f"  - sample_dt_mode_consistency: {self.sample_dt_mode_consistency}", "yellow")
         cprint(f"  - sample_target_t_mode: {self.sample_target_t_mode}", "yellow")
+        
+        # 🔥 运行时验证encoder和model的维度对齐
+        self._validate_dimensions()
 
         print_params(self)
+    
+    def _validate_dimensions(self):
+        """运行时验证encoder输出和model输入的维度对齐"""
+        # 检查encoder是否支持token序列输出
+        if hasattr(self.obs_encoder, 'output_token_sequence'):
+            token_seq_mode = self.obs_encoder.output_token_sequence
+            cprint(f"[Validation] Encoder token_sequence mode: {token_seq_mode}", "cyan")
+            
+            # 检查RGB特征维度
+            if hasattr(self.obs_encoder, 'rgb_feature_dim'):
+                rgb_dim = self.obs_encoder.rgb_feature_dim
+                cprint(f"[Validation] RGB feature dim: {rgb_dim}", "cyan")
+                
+                # 检查model的cond_dim是否匹配
+                if hasattr(self.model, 'vis_cond_obs_emb'):
+                    model_cond_dim = self.model.vis_cond_obs_emb.in_features
+                    if rgb_dim != model_cond_dim:
+                        cprint(f"[WARNING] Dimension mismatch! RGB dim ({rgb_dim}) != Model cond_dim ({model_cond_dim})", "red")
+                    else:
+                        cprint(f"[Validation] ✓ Dimensions aligned: {rgb_dim}", "green")
+            
+            # 检查触觉特征维度
+            if hasattr(self.obs_encoder, 'tactile_feature_dim') and self.obs_encoder.tactile_feature_dim is not None:
+                tactile_dim = self.obs_encoder.tactile_feature_dim
+                cprint(f"[Validation] Tactile feature dim: {tactile_dim}", "cyan")
+                
+                if hasattr(self.obs_encoder, 'rgb_feature_dim'):
+                    if tactile_dim != self.obs_encoder.rgb_feature_dim:
+                        cprint(f"[WARNING] Tactile dim ({tactile_dim}) != RGB dim ({self.obs_encoder.rgb_feature_dim})", "yellow")
+                        cprint(f"           Projection layers should be used for alignment", "yellow")
+            
+            # 检查位置编码长度
+            if token_seq_mode and hasattr(self.model, 'vis_cond_pos_embed'):
+                pos_embed_len = self.model.vis_cond_pos_embed.shape[1]
+                expected_len = self.model.visual_cond_len * self.n_obs_steps
+                if pos_embed_len == expected_len:
+                    cprint(f"[Validation] ✓ Position embedding length: {pos_embed_len} (visual_cond_len={self.model.visual_cond_len} × n_obs_steps={self.n_obs_steps})", "green")
+                else:
+                    cprint(f"[WARNING] Position embedding mismatch! {pos_embed_len} != {expected_len}", "red")
     
     # ========= Attention Recording ============
     def set_record_attn(self, record: bool):

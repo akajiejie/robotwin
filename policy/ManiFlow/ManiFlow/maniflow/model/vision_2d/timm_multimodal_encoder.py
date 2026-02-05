@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import logging
+from typing import Optional, Tuple, Dict, Union
 from termcolor import cprint
 
 from maniflow.model.common.module_attr_mixin import ModuleAttrMixin
@@ -88,7 +89,9 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             tactile_model_name: str='resnet18',
             tactile_pretrained: bool=False,
             tactile_frozen: bool=False,
-            tactile_feature_dim: int=512,
+            tactile_feature_dim: int=64,  # 🔥 默认值改为64（与robomimic一致）
+            tactile_num_kp: int=32,  # 🆕 SpatialSoftmax关键点数量
+            tactile_crop_shape: Optional[Union[Tuple[int, int], Dict[str, Tuple[int, int]]]]=None,  # 🆕 触觉裁剪尺寸
             share_tactile_model: bool=False,
             tactile_output_all_patches: bool=False,  # 🔥 触觉是否输出所有patch tokens
             # 🆕 模态级MoE支持
@@ -106,6 +109,8 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             downsample_ratio: RGB下采样比率
             tactile_model_name: 触觉编码器模型名称
             tactile_feature_dim: 触觉特征输出维度
+            tactile_num_kp: SpatialSoftmax关键点数量（默认32，与robomimic一致）
+            tactile_crop_shape: 触觉图像裁剪尺寸，可选
             share_tactile_model: 是否在多个触觉传感器间共享权重
             tactile_output_all_patches: 触觉是否输出所有patch tokens
             output_token_sequence: 是否输出token序列格式（用于模态级MoE）
@@ -250,11 +255,14 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
                 use_group_norm=use_group_norm,
                 share_tactile_model=share_tactile_model,
                 feature_dim=tactile_feature_dim,
-                output_all_patches=tactile_output_all_patches  # 🔥 传递patch输出参数
+                num_kp=tactile_num_kp,  # 🆕 传递关键点数量
+                crop_shape=tactile_crop_shape,  # 🆕 传递裁剪尺寸
+                output_all_patches=tactile_output_all_patches
             )
             
             cprint(f"✓ 触觉编码器: {tactile_encoder.tactile_keys}, "
-                   f"特征维度={tactile_feature_dim}, 共享权重={share_tactile_model}, "
+                   f"特征维度={tactile_feature_dim}, num_kp={tactile_num_kp}, "
+                   f"crop={tactile_crop_shape}, 共享权重={share_tactile_model}, "
                    f"输出patch tokens={tactile_output_all_patches}", 'green')
         
         # ============ 触觉投影层（用于维度对齐） ============
@@ -304,6 +312,8 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         
         self.tactile_encoder = tactile_encoder
         self.tactile_feature_dim = tactile_feature_dim
+        self.tactile_num_kp = tactile_num_kp  # 🆕 保存新参数
+        self.tactile_crop_shape = tactile_crop_shape  # 🆕 保存新参数
         
         self.share_rgb_model = share_rgb_model
         self.share_tactile_model = share_tactile_model
@@ -839,7 +849,9 @@ if __name__ == '__main__':
         downsample_ratio=32,
         tactile_model_name='resnet18',
         tactile_pretrained=False,
-        tactile_feature_dim=512,
+        tactile_feature_dim=64,  # 🔥 与robomimic一致
+        tactile_num_kp=32,       # 🆕 关键点数量
+        tactile_crop_shape=None, # 🆕 不裁剪
         share_tactile_model=True,
     )
     
@@ -861,7 +873,9 @@ if __name__ == '__main__':
         downsample_ratio=32,
         tactile_model_name='resnet18',
         tactile_pretrained=False,
-        tactile_feature_dim=512,
+        tactile_feature_dim=512,  # 与RGB特征维度对齐
+        tactile_num_kp=32,        # 🆕 关键点数量
+        tactile_crop_shape=None,  # 🆕 不裁剪
         share_tactile_model=True,
         tactile_output_all_patches=True,
         output_token_sequence=True,
@@ -893,8 +907,10 @@ if __name__ == '__main__':
     print(f"  输出形状: {output.shape}")
     
     # 维度验证 (注意: TimmTactileEncoder保留时序维度)
+    # 标准模式下tactile_feature_dim=64
+    tactile_feat_dim = encoder.tactile_feature_dim
     rgb_dim = 3 * 512 * 7 * 7 * time_steps  # 3相机 × 512特征 × 7×7 × 2T
-    tactile_dim = 2 * 512 * time_steps  # 2传感器 × 512特征 × 2T (保留时序维度)
+    tactile_dim = 2 * tactile_feat_dim * time_steps  # 2传感器 × feature_dim × 2T
     lowdim_dim = 14 * time_steps  # 14维 × 2T
     expected_dim = rgb_dim + tactile_dim + lowdim_dim
     

@@ -17,9 +17,12 @@ obs_as_global_cond: true
 policy:
   _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
   
+  # 🔥 观测编码维度（必须与obs_encoder输出维度一致）
+  cond_dim: 768  # SigLIP ViT-Base输出维度，也是tactile和proprio投影后的维度
+  
   # Gate-Attention 配置
   use_gate_attn: true       # 启用 Gate-Attention 机制（使用DiTXGateAttn）
-  gate_type: "elementwise"  # Gate-Attention类型: 'none', 'headwise', 'elementwise'
+  gate_type: "headwise"  # Gate-Attention类型: 'none', 'headwise', 'elementwise'
                             # - 'none': 标准cross-attention（无gate）
                             # - 'headwise': 每个注意力头一个gate值（轻量级）
                             # - 'elementwise': 每个元素一个gate值（最细粒度，参考Qwen3）
@@ -30,15 +33,22 @@ policy:
   n_head: 8
   n_emb: 768
   
-  # TimmMultimodalEncoder 输出 (每时间步):
-  #   - head_cam: 1 token
-  #   - left_wrist_cam: 1 token
-  #   - right_wrist_cam: 1 token
-  #   - left_tactile: 1 token
-  #   - right_tactile: 1 token
-  #   - proprio: 1 token
-  # 每时间步: 6 tokens, 总计: 6 × n_obs_steps(2) = 12 tokens
-  visual_cond_len: 6
+  # 🔥 TimmMultimodalEncoder 在 output_token_sequence=True 模式下的输出：
+  #    输出格式: (B, L_total, D)，其中 L_total = 所有模态的token数（已展开时间步）
+  #    
+  #    Token组织结构（按模态分组，每个模态内按时间步排列）：
+  #    - head模态:      [head_cam_t0, head_cam_t1]           = 2 tokens
+  #    - rgb_wrist模态: [L_wrist_t0, L_wrist_t1, R_wrist_t0, R_wrist_t1] = 4 tokens
+  #    - tactile模态:   [L_tactile_t0, L_tactile_t1, R_tactile_t0, R_tactile_t1] = 4 tokens
+  #    - proprio模态:   [proprio_t0, proprio_t1]             = 2 tokens
+  #    
+  #    总token数: L_total = 2 + 4 + 4 + 2 = 12
+  #    
+  # 🔥 DiTX位置编码配置:
+  #    self.vis_cond_pos_embed = nn.Parameter(torch.zeros(1, visual_cond_len * n_obs_steps, n_emb))
+  #    所以需要: visual_cond_len × n_obs_steps = L_total
+  #    即: visual_cond_len = L_total / n_obs_steps = 12 / 2 = 6
+  visual_cond_len: 6  # 每个时间步的模态数（DiTX内部会 × n_obs_steps = 2 得到12个位置编码）
   
   max_lang_cond_len: 1024
   qkv_bias: true
@@ -78,22 +88,24 @@ policy:
     tactile_model_name: 'resnet18'
     tactile_pretrained: false
     tactile_frozen: false
-    tactile_feature_dim: 768   #与RGB特征维度一致
+    tactile_feature_dim: 768   # 与RGB特征维度一致（SigLIP base为768）
+    tactile_num_kp: 32         # 🆕 SpatialSoftmax关键点数量（与robomimic一致）
+    tactile_crop_shape: null   # 🆕 触觉裁剪尺寸，null表示不裁剪（可设为[56, 112]）
     share_tactile_model: true
-    tactile_output_all_patches: false  #改为false，每个触觉传感器每时间步输出1个token
+    tactile_output_all_patches: false  # 改为false，每个触觉传感器每时间步输出1个token
     
     #####输出token序列模式 #####
     output_token_sequence: true
     
     transforms:
       - type: RandomCrop
-        ratio: 0.95
+        ratio: 0.85
       - _target_: torchvision.transforms.RandomRotation
         degrees: [-5.0, 5.0]
         expand: false
       - _target_: torchvision.transforms.ColorJitter
-        brightness: 0.3
-        contrast: 0.4
+        brightness: 0.4
+        contrast: 0.5
         saturation: 0.5
         hue: 0.08
      
@@ -125,10 +137,10 @@ val_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 5.0e-4
+  lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  weight_decay: 1.0e-3
+  weight_decay: 1.0e-4
 
 training:
   device: "cuda:0"
@@ -150,6 +162,14 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
+  
+  # 模态Drop配置（训练时数据增强，推理时自动关闭）
+  # 设计理念：模拟真实机器人操作中的传感器失效场景，提升模型鲁棒性
+  modality_drop:
+    head_drop: 0.15         # 25%概率Drop头部相机（模拟被机械臂遮挡）
+    rgb_wrist_drop: 0.05    # 5%概率Drop腕部相机（近距离视角，不易遮挡）
+    tactile_drop: 0.0       # 保留触觉（接触信息是兜底保障）
+    proprio_drop: 0.15      # 15%概率Drop本体感知（强制学习视觉-触觉依赖）
 
 logging:
   group: ${exp_name}
