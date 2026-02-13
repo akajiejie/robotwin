@@ -24,13 +24,12 @@ policy:
   n_head: 8
   n_emb: 768
   
-  # 🔥 视觉条件长度配置 (output_token_sequence=true + avg模式)
-  # TimmMultimodalEncoder + output_token_sequence=true + feature_aggregation='avg' 输出:
+  # 🔥 视觉条件长度配置 (output_token_sequence=true + head_grid_size=2)
+  # TimmMultimodalEncoder + output_token_sequence=true + head_grid_size=2 输出:
   #   ✅ RGB相机 (SigLIP vit_base_patch16_224):
-  #     - avg模式: 所有patches平均池化为1个token per image
-  #     - head_cam: 1相机 × 2时间步 × 1 token = 2 tokens
-  #     - left_wrist_cam: 1相机 × 2时间步 × 1 token = 2 tokens
-  #     - right_wrist_cam: 1相机 × 2时间步 × 1 token = 2 tokens
+  #     - head_cam: 1相机 × 2时间步 × (2×2) tokens = 8 tokens (空间降采样)
+  #     - left_wrist_cam: 1相机 × 2时间步 × 1 token = 2 tokens (avg pooling)
+  #     - right_wrist_cam: 1相机 × 2时间步 × 1 token = 2 tokens (avg pooling)
   #   
   #   ✅ 触觉传感器 (ResNet18 + GlobalAvgPool):
   #     - 触觉图经过ResNet18提取特征，GlobalAvgPool聚合为1个token per image
@@ -40,8 +39,12 @@ policy:
   #   ✅ 本体感知:
   #     - agent_pos投影后: 2时间步 = 2 tokens
   #   
-  #   总计: visual_cond_len = 2 + 2 + 2 + 2 + 2 + 2 = 12 tokens
-  visual_cond_len: 12  # 🔥 head(2) + left_wrist(2) + right_wrist(2) + left_tactile(2) + right_tactile(2) + proprio(2)
+  #   总计: visual_cond_len = 8 + 2 + 2 + 2 + 2 + 2 = 18 tokens
+  #   
+  #   📝 head_grid_size参数说明:
+  #     - head_grid_size=2: head输出 2×2=4 tokens/timestep → 2时间步 = 8 tokens
+  #     - head_grid_size=3: head输出 3×3=9 tokens/timestep → 2时间步 = 18 tokens
+  visual_cond_len: 18  # 🔥 head(8) + left_wrist(2) + right_wrist(2) + left_tactile(2) + right_tactile(2) + proprio(2)
   
   max_lang_cond_len: 1024
   qkv_bias: true
@@ -112,6 +115,10 @@ policy:
     
     ##### 🔥 输出token序列模式 #####
     output_token_sequence: true
+    
+    ##### 🆕 Head相机空间降采样配置 #####
+    head_grid_size: 2          # Head相机输出 2×2=4 tokens/timestep (避免权重塌陷)
+                               # 可选值: 2 (4 tokens), 3 (9 tokens), 4 (16 tokens)
     
     transforms:
       - type: RandomCrop

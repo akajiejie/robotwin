@@ -96,6 +96,7 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             tactile_output_all_patches: bool=False,  # 🔥 触觉是否输出所有patch tokens
             # 🆕 模态级MoE支持
             output_token_sequence: bool=False,
+            head_grid_size: int=1,  # 🔥 Head相机的空间重采样网格大小 (NxN), 默认1=单token
         ):
         """
         Args:
@@ -114,6 +115,7 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             share_tactile_model: 是否在多个触觉传感器间共享权重
             tactile_output_all_patches: 触觉是否输出所有patch tokens
             output_token_sequence: 是否输出token序列格式（用于模态级MoE）
+            head_grid_size: Head相机的输出token网格大小，生成 head_grid_size^2 个tokens
         """
         super().__init__()
         
@@ -331,6 +333,16 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
                 nn.init.zeros_(self.proprio_proj.bias)
                 cprint(f"  ✓ 本体感知投影层: {total_low_dim} -> {rgb_feature_dim}", 'green')
         
+        # 🆕 Head相机空间降采样配置
+        self.head_grid_size = head_grid_size
+        self.downsample_ratio = downsample_ratio
+        if output_token_sequence and head_grid_size > 1:
+            # 创建空间降采样层 (将特征图聚合为 NxN 个tokens)
+            self.head_spatial_pool = nn.AdaptiveAvgPool2d((head_grid_size, head_grid_size))
+            cprint(f"✓ Head相机空间重采样: {head_grid_size}x{head_grid_size} = {head_grid_size**2} tokens per timestep", 'cyan')
+        elif output_token_sequence:
+            cprint(f"✓ Head相机使用单token模式 (head_grid_size=1)", 'cyan')
+        
         # 🔥 模态Drop配置（用于训练时的数据增强）
         # 设计理念：模拟真实机器人操作中的传感器失效场景
         self.modality_drop_config = {
@@ -444,16 +456,20 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             assert self.feature_aggregation is None
             return feature.reshape(feature.shape[0], -1)  # B, H*W*C
     
-    def _extract_rgb_tokens(self, obs_dict, key):
+    def _extract_rgb_tokens(self, obs_dict, key, is_head_cam=False):
         """
         提取RGB图像的token表示（用于交叉注意力）
         
         Args:
             obs_dict: 观测字典
             key: RGB相机的key
+            is_head_cam: 是否是Head相机（用于空间重采样）
             
         Returns:
-            tokens: (B*T, N, D) - N为token数量（1+P for ViT, H*W for CNN）
+            tokens: (B*T, N, D) - N为token数量
+                   - Head相机 (head_grid_size > 1): N = head_grid_size^2 (空间重采样后)
+                   - Head相机 (head_grid_size = 1): N = 1 (聚合后的单token)
+                   - Wrist相机: N = 1 (聚合后的单token)
             batch_size: B
             time_steps: T
         """
@@ -484,18 +500,57 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         img = img.float()
         raw_feature = self.rgb_model_map[key](img).to(self.device)
         
-        # 转换为token格式
-        if self.model_name.startswith('vit') or 'siglip' in self.model_name.lower():
-            # ViT/SigLIP: 已经是token格式 (B*T, N, D)
-            tokens = raw_feature
+        # 🔥 核心逻辑：根据相机类型和grid_size决定token生成策略
+        if is_head_cam and hasattr(self, 'head_spatial_pool') and self.head_grid_size > 1:
+            # === Head相机空间重采样模式 (head_grid_size > 1) ===
+            # 将特征转换为2D空间特征图，然后重采样为 NxN 个tokens
+            
+            if self.model_name.startswith('vit') or 'siglip' in self.model_name.lower():
+                # ViT/SigLIP: 输出格式为 (B*T, 1+P, D) 或 (B*T, P, D)
+                # 需要将patch tokens转换为空间特征图
+                
+                feature_dim = raw_feature.shape[-1]
+                
+                # 去掉CLS token（如果存在）
+                if raw_feature.shape[1] == 197:  # ViT-Base: 1 CLS + 196 patches (14x14)
+                    patch_tokens = raw_feature[:, 1:, :]  # (B*T, 196, D)
+                    spatial_size = int(math.sqrt(patch_tokens.shape[1]))  # 14
+                elif 'siglip' in self.model_name.lower():
+                    # SigLIP输出: (B*T, P, D) 没有CLS token
+                    patch_tokens = raw_feature
+                    spatial_size = int(math.sqrt(patch_tokens.shape[1]))
+                else:
+                    # 其他情况：假设没有CLS token
+                    patch_tokens = raw_feature
+                    spatial_size = int(math.sqrt(patch_tokens.shape[1]))
+                
+                # 重塑为空间特征图: (B*T, P, D) -> (B*T, D, H, W)
+                spatial_feature = patch_tokens.permute(0, 2, 1).reshape(
+                    B*T, feature_dim, spatial_size, spatial_size
+                )
+                
+            else:
+                # CNN: 已经是空间特征图格式 (B*T, C, H, W)
+                spatial_feature = raw_feature
+            
+            # 🔥 空间重采样: (B*T, D, H, W) -> (B*T, D, N, N)
+            downsampled = self.head_spatial_pool(spatial_feature)  # (B*T, D, grid_size, grid_size)
+            
+            # 拉平为tokens: (B*T, D, N, N) -> (B*T, N^2, D)
+            tokens = downsampled.flatten(2).permute(0, 2, 1)  # (B*T, grid_size^2, D)
+            
         else:
-            # CNN: 需要转换 (B*T, C, H, W) -> (B*T, H*W, C)
-            # 添加一个虚拟的CLS token
-            tokens = torch.flatten(raw_feature, start_dim=-2)  # (B*T, C, H*W)
-            tokens = torch.transpose(tokens, 1, 2)  # (B*T, H*W, C)
-            # 添加CLS token (均值池化)
-            cls_token = torch.mean(tokens, dim=1, keepdim=True)  # (B*T, 1, C)
-            tokens = torch.cat([cls_token, tokens], dim=1)  # (B*T, 1+H*W, C)
+            # === 单token模式（Wrist相机 或 Head相机grid_size=1） ===
+            # 使用mean pooling聚合为单个token
+            
+            if self.model_name.startswith('vit') or 'siglip' in self.model_name.lower():
+                # ViT/SigLIP: 直接对所有tokens做mean pooling
+                tokens = torch.mean(raw_feature, dim=1, keepdim=True)  # (B*T, 1, D)
+            else:
+                # CNN: 先展平空间维度，再mean pooling
+                tokens = torch.flatten(raw_feature, start_dim=-2)  # (B*T, C, H*W)
+                tokens = torch.transpose(tokens, 1, 2)  # (B*T, H*W, C)
+                tokens = torch.mean(tokens, dim=1, keepdim=True)  # (B*T, 1, C)
         
         return tokens, B, T
     
@@ -610,17 +665,16 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         for key in self.rgb_keys:
             is_head_cam = 'head' in key.lower() or 'front' in key.lower()
             
-            tokens, B, T = self._extract_rgb_tokens(obs_dict, key)
+            tokens, B, T = self._extract_rgb_tokens(obs_dict, key, is_head_cam)
             
-            # 🔥 根据feature_aggregation决定是否聚合
-            if self.feature_aggregation == 'all_tokens':
-                # 保留所有tokens: (B*T, N, D) -> (B, T*N, D)
-                num_tokens = tokens.shape[1]
-                token_seq = tokens.reshape(B, T * num_tokens, -1)  # (B, T*N, D)
-            else:
-                # 聚合为每个时间步一个token
-                token_agg = torch.mean(tokens, dim=1)  # (B*T, D)
-                token_seq = token_agg.reshape(B, T, -1)  # (B, T, D)
+            # 🔥 tokens已经是正确格式：
+            # - Head相机 (grid_size > 1): (B*T, grid_size^2, D)
+            # - Head相机 (grid_size = 1): (B*T, 1, D)
+            # - Wrist相机: (B*T, 1, D)
+            
+            # 重塑为 (B, T*num_tokens, D)
+            num_tokens_per_timestep = tokens.shape[1]  # grid_size^2 或 1
+            token_seq = tokens.reshape(B, T * num_tokens_per_timestep, -1)  # (B, T*N, D)
             
             if is_head_cam:
                 head_tokens_list.append(token_seq)
@@ -643,7 +697,7 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
                     elif 'right' in key.lower() and hasattr(self, 'right_tactile_proj'):
                         tact_tok = self.right_tactile_proj(tact_tok)
                     
-                    # 🔥 触觉编码器保留时序维度，直接使用
+                    # 触觉编码器保留时序维度，直接使用
                     # output_all_patches=True: (B, T*H*W, D) - 保留所有时间步的所有patch
                     # output_all_patches=False: (B, T, D) - 保留所有时间步，每个时间步1个token
                     tactile_tokens_list.append(tact_tok)

@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import re
+import math
 import logging
 from typing import Union, Tuple
 import numpy as np
@@ -21,6 +22,85 @@ from maniflow.model.diffusion.ditx_gateattn_block import DiTXGateAttnBlock
 from termcolor import cprint
 
 logger = logging.getLogger(__name__)
+
+
+def get_2d_sincos_pos_embed(embed_dim, grid_h, grid_w, cls_token=False, temperature=10000.0):
+    """
+    生成2D正弦余弦位置编码（参考MAE实现）
+    
+    Args:
+        embed_dim: 嵌入维度（必须是偶数）
+        grid_h: 网格高度
+        grid_w: 网格宽度
+        cls_token: 是否添加CLS token位置
+        temperature: 温度参数（控制频率范围）
+    
+    Returns:
+        pos_embed: (grid_h*grid_w, embed_dim) 或 (1+grid_h*grid_w, embed_dim) 如果cls_token=True
+    """
+    grid_h_coords = np.arange(grid_h, dtype=np.float32)
+    grid_w_coords = np.arange(grid_w, dtype=np.float32)
+    grid = np.meshgrid(grid_w_coords, grid_h_coords)  # (H, W)
+    grid = np.stack(grid, axis=0)  # (2, H, W)
+    
+    grid = grid.reshape([2, 1, grid_h, grid_w])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid, temperature)
+    
+    if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid, temperature=10000.0):
+    """
+    从2D网格生成正弦余弦位置编码
+    
+    Args:
+        embed_dim: 嵌入维度
+        grid: (2, 1, H, W) 网格坐标
+        temperature: 温度参数
+    
+    Returns:
+        pos_embed: (H*W, embed_dim)
+    """
+    assert embed_dim % 2 == 0, "embed_dim必须是偶数"
+    
+    # 使用一半维度编码y坐标，另一半编码x坐标
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0], temperature)  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1], temperature)  # (H*W, D/2)
+    
+    pos_embed = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
+    return pos_embed
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos, temperature=10000.0):
+    """
+    从1D位置生成正弦余弦编码
+    
+    Args:
+        embed_dim: 输出维度
+        pos: (M,) 或 (1, H, W) 位置数组
+        temperature: 温度参数
+    
+    Returns:
+        emb: (M, embed_dim) 位置编码
+    """
+    assert embed_dim % 2 == 0, "embed_dim必须是偶数"
+    
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / (temperature ** omega)  # (D/2,)
+    
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2) 外积
+    
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
+    
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
 
 class FinalLayer(nn.Module):
     """
@@ -159,6 +239,9 @@ class DiTXGateAttn(nn.Module):
         # Gate bias初始化标志
         self._gate_bias_initialized = False
         
+        # 位置编码初始化标志
+        self._pos_embed_initialized = False
+        
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
@@ -247,6 +330,142 @@ class DiTXGateAttn(nn.Module):
             if hasattr(block, 'set_modality_ranges'):
                 block.set_modality_ranges(modality_info)
         # logger.info(f"[DiTXGateAttn] Gate bias已初始化，模态信息: {modality_info}")
+    
+    def _initialize_vis_pos_embed(self, modality_info: dict, head_grid_size: int = None):
+        """
+        🔥 基于模态感知的2D Sin-Cos位置编码初始化
+        
+        设计理念：为不同模态注入合适的几何先验
+        - Head相机: 2D Sin-Cos编码（利用$N \times N$网格的空间几何结构）
+        - Wrist相机: 1D Sin-Cos编码（序列结构）
+        - Tactile: 1D Sin-Cos编码（序列结构）
+        - Proprio: 1D Sin-Cos编码（序列结构）
+        
+        Args:
+            modality_info: 模态token数量，例如 {'head': 32, 'rgb_wrist': 4, 'tactile': 4, 'proprio': 2}
+            head_grid_size: Head相机的网格大小（用于计算2D编码）
+        """
+        if modality_info is None:
+            logger.warning("[DiTXGateAttn] modality_info为None，跳过位置编码初始化")
+            return
+        
+        # 计算token组织: [head, rgb_wrist, tactile, proprio]
+        start_idx = 0
+        pos_embed_data = self.vis_cond_pos_embed.data  # (1, L_total, n_emb)
+        L_total = pos_embed_data.shape[1]
+        embed_dim = pos_embed_data.shape[2]
+        
+        cprint(f"[DiTXGateAttn] 开始初始化位置编码: L_total={L_total}, embed_dim={embed_dim}", 'cyan')
+        cprint(f"[DiTXGateAttn] 模态信息: {modality_info}", 'cyan')
+        
+        # === 1. Head相机: 2D Sin-Cos编码 ===
+        if 'head' in modality_info and modality_info['head'] > 0:
+            n_head_tokens = modality_info['head']
+            
+            # 推断grid_size: n_head_tokens = T * grid_size^2
+            # 默认n_obs_steps=2，所以 grid_size^2 = n_head_tokens / T
+            if head_grid_size is None:
+                # 自动推断
+                tokens_per_timestep = n_head_tokens // self.n_obs_steps
+                head_grid_size = int(math.sqrt(tokens_per_timestep))
+                
+                if head_grid_size * head_grid_size != tokens_per_timestep:
+                    logger.warning(f"[Head] 无法推断完美的网格大小: {tokens_per_timestep} tokens/timestep")
+                    head_grid_size = 1  # 回退到1D编码
+            
+            if head_grid_size > 1:
+                # 🔥 2D空间编码
+                cprint(f"[Head] 使用2D Sin-Cos编码: {head_grid_size}x{head_grid_size} 网格, {self.n_obs_steps}帧", 'green')
+                
+                # 生成单帧的2D位置编码
+                pos_embed_2d_single = get_2d_sincos_pos_embed(
+                    embed_dim=embed_dim,
+                    grid_h=head_grid_size,
+                    grid_w=head_grid_size,
+                    cls_token=False
+                )  # (grid_size^2, embed_dim)
+                
+                # 为多帧叠加时间偏置
+                for t in range(self.n_obs_steps):
+                    # 时间偏置: 使用1D Sin-Cos编码在频率空间与空间坐标解耦
+                    time_embed = get_1d_sincos_pos_embed_from_grid(
+                        embed_dim=embed_dim,
+                        pos=np.array([t], dtype=np.float32),
+                        temperature=10000.0  # 与空间编码相同的温度
+                    )  # (1, embed_dim)
+                    
+                    # 叠加: spatial + temporal
+                    # 使用加权叠加：空间0.8 + 时间0.2，确保空间先验占主导
+                    pos_embed_frame = 0.8 * pos_embed_2d_single + 0.2 * time_embed
+                    
+                    # 填充到vis_cond_pos_embed
+                    frame_start = start_idx + t * (head_grid_size ** 2)
+                    frame_end = frame_start + (head_grid_size ** 2)
+                    pos_embed_data[0, frame_start:frame_end, :] = torch.from_numpy(pos_embed_frame).float()
+                
+                cprint(f"[Head] ✓ 2D位置编码已注入: tokens [{start_idx}:{start_idx + n_head_tokens}]", 'green')
+            else:
+                # 1D编码回退
+                cprint(f"[Head] 使用1D Sin-Cos编码（回退模式）", 'yellow')
+                pos_embed_1d = get_1d_sincos_pos_embed_from_grid(
+                    embed_dim=embed_dim,
+                    pos=np.arange(n_head_tokens, dtype=np.float32),
+                    temperature=10000.0
+                )
+                pos_embed_data[0, start_idx:start_idx + n_head_tokens, :] = torch.from_numpy(pos_embed_1d).float()
+            
+            start_idx += n_head_tokens
+        
+        # === 2. Wrist相机: 1D Sin-Cos编码 ===
+        if 'rgb_wrist' in modality_info and modality_info['rgb_wrist'] > 0:
+            n_wrist_tokens = modality_info['rgb_wrist']
+            cprint(f"[Wrist] 使用1D Sin-Cos编码: {n_wrist_tokens} tokens", 'green')
+            
+            pos_embed_1d = get_1d_sincos_pos_embed_from_grid(
+                embed_dim=embed_dim,
+                pos=np.arange(n_wrist_tokens, dtype=np.float32),
+                temperature=10000.0
+            )
+            pos_embed_data[0, start_idx:start_idx + n_wrist_tokens, :] = torch.from_numpy(pos_embed_1d).float()
+            cprint(f"[Wrist] ✓ 1D位置编码已注入: tokens [{start_idx}:{start_idx + n_wrist_tokens}]", 'green')
+            start_idx += n_wrist_tokens
+        
+        # === 3. Tactile: 1D Sin-Cos编码 ===
+        if 'tactile' in modality_info and modality_info['tactile'] > 0:
+            n_tactile_tokens = modality_info['tactile']
+            cprint(f"[Tactile] 使用1D Sin-Cos编码: {n_tactile_tokens} tokens", 'green')
+            
+            pos_embed_1d = get_1d_sincos_pos_embed_from_grid(
+                embed_dim=embed_dim,
+                pos=np.arange(n_tactile_tokens, dtype=np.float32),
+                temperature=10000.0
+            )
+            pos_embed_data[0, start_idx:start_idx + n_tactile_tokens, :] = torch.from_numpy(pos_embed_1d).float()
+            cprint(f"[Tactile] ✓ 1D位置编码已注入: tokens [{start_idx}:{start_idx + n_tactile_tokens}]", 'green')
+            start_idx += n_tactile_tokens
+        
+        # === 4. Proprio: 1D Sin-Cos编码 ===
+        if 'proprio' in modality_info and modality_info['proprio'] > 0:
+            n_proprio_tokens = modality_info['proprio']
+            cprint(f"[Proprio] 使用1D Sin-Cos编码: {n_proprio_tokens} tokens", 'green')
+            
+            pos_embed_1d = get_1d_sincos_pos_embed_from_grid(
+                embed_dim=embed_dim,
+                pos=np.arange(n_proprio_tokens, dtype=np.float32),
+                temperature=10000.0
+            )
+            pos_embed_data[0, start_idx:start_idx + n_proprio_tokens, :] = torch.from_numpy(pos_embed_1d).float()
+            cprint(f"[Proprio] ✓ 1D位置编码已注入: tokens [{start_idx}:{start_idx + n_proprio_tokens}]", 'green')
+            start_idx += n_proprio_tokens
+        
+        # 验证所有token都被覆盖
+        if start_idx != L_total:
+            logger.warning(f"[DiTXGateAttn] 位置编码覆盖不完整: {start_idx}/{L_total} tokens")
+        else:
+            cprint(f"[DiTXGateAttn] ✅ 位置编码初始化完成: {L_total} tokens 全部覆盖", 'green')
+        
+        # 标记已初始化
+        self._pos_embed_initialized = True
     
     def initialize_weights(self):
         # DiTXGateAttnBlock 使用 FlashSelfAttention，结构不同，需要适配初始化
@@ -352,7 +571,14 @@ class DiTXGateAttn(nn.Module):
         This long function is unfortunately doing something very simple and is being very defensive:
         We are separating out all parameters of the model into two buckets: those that will experience
         weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
-        We are then returning the PyTorch optimizer object.
+        
+        🔥 Gate-Attention保护机制（高优先级）:
+        为了防止Gate Collapse，以下参数**强制排除**Weight Decay：
+        1. cross_attn.q: Query投影层（生成gate score的核心）
+        2. modality_bias或_modality_bias_tensor: 模态特定的gate初始化偏置
+        3. 任何包含"gate"关键词的参数（门控相关）
+        
+        这些参数如果被Weight Decay惩罚，会导致门控值趋向于0，引发Gate Collapse。
         """
 
         # separate out all parameters to those that will and won't experience regularizing weight decay
@@ -360,10 +586,23 @@ class DiTXGateAttn(nn.Module):
         no_decay = set()
         whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention)
         blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RmsNorm)
+        
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
 
+                # 🔥 **高优先级**: Gate相关参数强制保护（必须排在所有判断之前）
+                # 防止Gate Collapse: 如果参数名包含gate关键词，强制加入no_decay
+                gate_related_keywords = ['cross_attn.q', 'modality_bias', '_modality_bias_tensor', 'gate']
+                is_gate_related = any(keyword in fpn for keyword in gate_related_keywords)
+                
+                if is_gate_related:
+                    # Gate相关参数**绝对不能**应用Weight Decay
+                    no_decay.add(fpn)
+                    cprint(f"[Gate Protection] 保护参数: {fpn} (强制关闭Weight Decay)", "yellow")
+                    continue  # 跳过后续判断，确保不会被加入decay组
+                
+                # 原有的参数分组逻辑（仅处理非gate参数）
                 if pn.endswith("bias"):
                     # all biases will not be decayed
                     no_decay.add(fpn)
@@ -395,6 +634,14 @@ class DiTXGateAttn(nn.Module):
         ), "parameters %s were not separated into either decay/no_decay set!" % (
             str(param_dict.keys() - union_params),
         )
+
+        # 🔥 统计Gate保护的参数数量
+        gate_protected_params = [pn for pn in no_decay if any(kw in pn for kw in ['cross_attn.q', 'modality_bias', 'gate'])]
+        if gate_protected_params:
+            cprint(f"[Gate Protection] 共保护 {len(gate_protected_params)} 个Gate相关参数，免受Weight Decay惩罚", "green")
+            cprint(f"[Gate Protection] 保护的参数列表:", "green")
+            for pn in sorted(gate_protected_params):
+                cprint(f"  - {pn}", "green")
 
         # create the pytorch optimizer object
         optim_groups = [
@@ -691,12 +938,20 @@ class DiTXGateAttn(nn.Module):
             context_c = torch.cat([context_c, lang_c], dim=1) # (B, L + L_lang, n_emb)
 
 
-        # 首次前向传播时自动初始化gate bias
+        # 首次前向传播时自动初始化gate bias和位置编码
         if not self._gate_bias_initialized and self.gate_type != 'none':
             modality_info = kwargs.get('modality_info', None)
             if modality_info is not None:
                 self._initialize_gate_bias(modality_info)
                 self._gate_bias_initialized = True
+        
+        # 🔥 延迟初始化vis_cond_pos_embed（基于模态感知的2D Sin-Cos编码）
+        if not self._pos_embed_initialized:
+            modality_info = kwargs.get('modality_info', None)
+            head_grid_size = kwargs.get('head_grid_size', None)
+            if modality_info is not None:
+                self._initialize_vis_pos_embed(modality_info, head_grid_size)
+                self._pos_embed_initialized = True
 
         # 5. transformer blocks with Gate-Attention
         for block in self.blocks:

@@ -1,10 +1,10 @@
 defaults:
   - task: demo_task_tactile
 
-name: train_maniflow_tactile_image_policy_gateattn
+name: train_maniflow_tactile_image_policy_gateattn_no_gate_decay
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "flow_tactile_image_gateattn"
+exp_name: "flow_tactile_image_gateattn_no_gate_decay"
 
 horizon: 32
 n_obs_steps: 2
@@ -20,11 +20,11 @@ policy:
   # 🔥 观测编码维度（必须与obs_encoder输出维度一致）
   cond_dim: 768  # SigLIP ViT-Base输出维度，也是tactile和proprio投影后的维度
   
-  # Gate-Attention 配置
+  # 🔥🔥🔥 Gate-Attention 配置 - 关闭Gate参数的Weight Decay实验 🔥🔥🔥
   use_gate_attn: true       # 启用 Gate-Attention 机制（使用DiTXGateAttn）
-  gate_type: "headwise"  # Gate-Attention类型: 'none', 'headwise', 'elementwise'
+  gate_type: "headwise"     # Gate-Attention类型: 'none', 'headwise', 'elementwise'
                             # - 'none': 标准cross-attention（无gate）
-                            # - 'headwise': 每个注意力头一个gate值（轻量级）
+                            # - 'headwise': 每个注意力头一个gate值（轻量级）⭐ 当前使用
                             # - 'elementwise': 每个元素一个gate值（最细粒度，参考Qwen3）
   block_type: "DiTX"        # 保留此参数以保持向后兼容性
   
@@ -37,18 +37,18 @@ policy:
   #    输出格式: (B, L_total, D)，其中 L_total = 所有模态的token数（已展开时间步）
   #    
   #    Token组织结构（按模态分组，每个模态内按时间步排列）：
-  #    - head模态 (head_grid_size=2):  [head_t0_tokens(4个), head_t1_tokens(4个)] = 8 tokens
+  #    - head模态 (head_grid_size=6):  [head_t0_tokens(36个), head_t1_tokens(36个)] = 72 tokens
   #    - rgb_wrist模态: [L_wrist_t0, L_wrist_t1, R_wrist_t0, R_wrist_t1] = 4 tokens
   #    - tactile模态:   [L_tactile_t0, L_tactile_t1, R_tactile_t0, R_tactile_t1] = 4 tokens
   #    - proprio模态:   [proprio_t0, proprio_t1]             = 2 tokens
   #    
-  #    总token数: L_total = 8 + 4 + 4 + 2 = 18 (当head_grid_size=2时)
+  #    总token数: L_total = 72 + 4 + 4 + 2 = 82 (当head_grid_size=6时)
   #    
   # 🔥 DiTX位置编码配置:
   #    self.vis_cond_pos_embed = nn.Parameter(torch.zeros(1, visual_cond_len * n_obs_steps, n_emb))
   #    所以需要: visual_cond_len × n_obs_steps = L_total
-  #    即: visual_cond_len = L_total / n_obs_steps = 18 / 2 = 9
-  visual_cond_len: 41  # 每个时间步的模态token数（DiTX内部会 × n_obs_steps = 2 得到18个位置编码）
+  #    即: visual_cond_len = L_total / n_obs_steps = 82 / 2 = 41
+  visual_cond_len: 21  # 每个时间步的模态token数（DiTX内部会 × n_obs_steps = 2 得到82个位置编码）
   
   max_lang_cond_len: 1024
   qkv_bias: true
@@ -81,7 +81,7 @@ policy:
     pretrained: true
     frozen: false
     global_pool: ''
-    head_grid_size: 6  # 新增：设置为2代表输出2x2=4个tokens
+    head_grid_size: 4  # 设置为6代表输出6x6=36个tokens（保留更多空间信息）
     feature_aggregation: 'avg' # 其他相机（如腕部）依然维持1个token
     downsample_ratio: 32
     
@@ -136,12 +136,21 @@ val_dataloader:
   pin_memory: True
   persistent_workers: False
 
+# 🔥🔥🔥 优化器配置 - Gate参数免除Weight Decay实验 🔥🔥🔥
+# 核心改动：get_optim_groups 函数已自动将以下参数排除在weight_decay之外：
+#   1. cross_attn.q.weight / cross_attn.q.bias (生成gate score的核心)
+#   2. _modality_bias_tensor (模态特定的gate初始化偏置)
+#   3. 任何包含"gate"关键词的参数
+# 
+# 实验对比组：
+#   - 基线组（原始配置）: weight_decay=1.0e-4，所有参数都受惩罚
+#   - 实验组（本配置）: weight_decay=1.0e-4，但Gate参数被自动保护
 optimizer:
   _target_: torch.optim.AdamW
   lr: 2.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  weight_decay: 1.0e-4
+  weight_decay: 1.0e-4  # 🔥 保持相同的weight_decay值，但Gate参数会被自动排除
 
 training:
   device: "cuda:0"
@@ -167,16 +176,16 @@ training:
   # 模态Drop配置（训练时数据增强，推理时自动关闭）
   # 设计理念：模拟真实机器人操作中的传感器失效场景，提升模型鲁棒性
   modality_drop:
-    head_drop: 0.2         # 15%概率Drop头部相机（模拟被机械臂遮挡）
-    rgb_wrist_drop: 0.05    # 5%概率Drop腕部相机（近距离视角，不易遮挡）
-    tactile_drop: 0.0       # 保留触觉（接触信息是兜底保障）
-    proprio_drop: 0.2      # 50%概率Drop本体感知（强制学习视觉-触觉依赖）
+    head_drop: 0.2         # 20%概率Drop头部相机（模拟被机械臂遮挡）
+    rgb_wrist_drop: 0.05   # 5%概率Drop腕部相机（近距离视角，不易遮挡）
+    tactile_drop: 0.0      # 保留触觉（接触信息是兜底保障）
+    proprio_drop: 0.2      # 20%概率Drop本体感知（强制学习视觉-触觉依赖）
 
 logging:
   group: ${exp_name}
   id: null
   mode: online
-  name: ${training.seed}
+  name: ${training.seed}_no_gate_decay
   project: ManiFlow_Tactile_Image_GateAttn
   resume: false
   tags:
@@ -184,7 +193,9 @@ logging:
   - ditx_gateattn
   - gate_attention
   - tactile_rgb
-  - elementwise_gate
+  - headwise_gate
+  - no_gate_decay  # 🔥 新增标签，用于对比实验
+  - gate_collapse_fix  # 🔥 标记为Gate Collapse修复实验
 
 checkpoint:
   save_ckpt: True

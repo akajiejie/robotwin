@@ -296,10 +296,13 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].to(device))
         nobs_features = self.obs_encoder(this_nobs).to(device)
         
-        # 获取模态信息（用于gate bias初始化）
+        # 获取模态信息（用于gate bias和位置编码初始化）
         modality_info = None
+        head_grid_size = None
         if hasattr(self.obs_encoder, 'get_modality_info'):
             modality_info = self.obs_encoder.get_modality_info()
+        if hasattr(self.obs_encoder, 'head_grid_size'):
+            head_grid_size = self.obs_encoder.head_grid_size
         
         # 支持token序列输出模式
         if hasattr(self.obs_encoder, 'output_token_sequence') and self.obs_encoder.output_token_sequence:
@@ -316,6 +319,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         kwargs_with_modality = {**self.kwargs}
         if modality_info is not None:
             kwargs_with_modality['modality_info'] = modality_info
+        if head_grid_size is not None:
+            kwargs_with_modality['head_grid_size'] = head_grid_size
         
         nsample = self.conditional_sample(
             cond_data, 
@@ -537,6 +542,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 vis_cond=vis_cond[-consistency_batchsize:],
                 lang_cond=lang_cond[-consistency_batchsize:] if lang_cond is not None else None,
                 modality_info=modality_info,
+                head_grid_size=model_kwargs.get('head_grid_size', None),
             ) 
         # predict the target data point using the average velocity
         pred_x1_ct = x_t_next + (1 - t_next) * v_avg_to_next_target
@@ -604,10 +610,13 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             lambda x: x[:,:self.n_obs_steps,...].to(self.device))
         nobs_features = self.obs_encoder(this_nobs)
         
-        # 获取模态信息（用于gate bias初始化）
+        # 获取模态信息（用于gate bias和位置编码初始化）
         modality_info = None
+        head_grid_size = None
         if hasattr(self.obs_encoder, 'get_modality_info'):
             modality_info = self.obs_encoder.get_modality_info()
+        if hasattr(self.obs_encoder, 'head_grid_size'):
+            head_grid_size = self.obs_encoder.head_grid_size
         
         # 支持token序列输出模式
         if hasattr(self.obs_encoder, 'output_token_sequence') and self.obs_encoder.output_token_sequence:
@@ -630,7 +639,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             target_t=flow_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[:flow_batchsize],
             lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
-            modality_info=modality_info)
+            modality_info=modality_info,
+            head_grid_size=head_grid_size)
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
         # Get consistency targets
@@ -638,7 +648,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                                                                         vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
                                                                         lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
                                                                         ema_model=ema_model,
-                                                                        modality_info=modality_info
+                                                                        modality_info=modality_info,
+                                                                        head_grid_size=head_grid_size
                                                                         )
         v_ct_pred = self.model(
             sample=consistency_target_dict['x_t'], 
@@ -646,7 +657,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             target_t=consistency_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
             lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-            modality_info=modality_info)
+            modality_info=modality_info,
+            head_grid_size=head_grid_size)
         v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
 
         """Compute losses"""

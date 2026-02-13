@@ -417,9 +417,9 @@ class DiTXGateAttnBlock(nn.Module):
         # proprio: -0.5 -> sigmoid(-0.5) = 0.38 (低初始权重)
         # head/rgb_wrist: 0.0 -> sigmoid(0.0) = 0.5 (中性)
         self.modality_bias_config = {
-            'tactile': 0.5,
+            'tactile': 1.5,
             'proprio': -0.5,
-            'head': 0.0,
+            'head': 1.0,
             'rgb_wrist': 0.0,
         }
 
