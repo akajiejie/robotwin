@@ -8,6 +8,6 @@ instruction_type: unseen
 
 # Add Parameters You Need
 config_name: robot_maniflow
-checkpoint_num: 100
+checkpoint_num: 150
 maniflow_task: demo_task
 expert_data_num: null

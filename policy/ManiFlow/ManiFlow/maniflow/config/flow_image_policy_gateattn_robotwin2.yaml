@@ -1,0 +1,231 @@
+defaults:
+  - task: demo_task_dual_image
+
+name: train_maniflow_image_policy_gateattn_no_gate_decay
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "flow_image_gateattn_no_gate_decay_sim"  # 🔥 添加sim标识，区分仿真实验
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 16
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: true
+
+policy:
+  _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
+  
+  # 🔥 观测编码维度（必须与obs_encoder输出维度一致）
+  cond_dim: 768  # SigLIP ViT-Base输出维度，也是proprio投影后的维度
+  
+  # 🔥🔥🔥 Gate-Attention 配置 - 关闭Gate参数的Weight Decay实验 🔥🔥🔥
+  use_gate_attn: true       # 启用 Gate-Attention 机制（使用DiTXGateAttn）
+  gate_type: "headwise"     # Gate-Attention类型: 'none', 'headwise', 'elementwise'
+                            # - 'none': 标准cross-attention（无gate）
+                            # - 'headwise': 每个注意力头一个gate值（轻量级）⭐ 当前使用
+                            # - 'elementwise': 每个元素一个gate值（最细粒度，参考Qwen3）
+  block_type: "DiTX"        # 保留此参数以保持向后兼容性
+  
+  # 架构配置
+  n_layer: 12
+  n_head: 8
+  n_emb: 768
+  
+  # 🔥🔥🔥 Head-Proprio融合策略后的Token组织（仿真环境-纯视觉）：
+  #    输出格式: (B, L_total, D)，其中 L_total = 所有模态的token数（已展开时间步）
+  #    
+  #    Token组织结构（按模态分组，每个模态内按时间步排列）：
+  #    - head模态 (head_grid_size=1, **已融合proprio**):  [head_t0_token(含proprio), head_t1_token(含proprio)] = 2 tokens
+  #    - rgb_wrist模态: [L_wrist_t0, L_wrist_t1, R_wrist_t0, R_wrist_t1] = 4 tokens
+  #    - **proprio模态: 已融合进head，不再作为独立token输出**
+  #    
+  #    总token数: L_total = 2 + 4 = 6 (Head含proprio + Wrist，无触觉)
+  #    
+  # 🔥 DiTX位置编码配置:
+  #    self.vis_cond_pos_embed = nn.Parameter(torch.zeros(1, visual_cond_len * n_obs_steps, n_emb))
+  #    所以需要: visual_cond_len × n_obs_steps = L_total
+  #    即: visual_cond_len = L_total / n_obs_steps = 6 / 2 = 3
+  visual_cond_len: 3  # 每个时间步的模态token数（DiTX内部会 × n_obs_steps = 2 得到6个位置编码）
+  
+  max_lang_cond_len: 1024
+  qkv_bias: true
+  qk_norm: true
+  language_conditioned: false
+  pre_norm_modality: false
+
+  flow_batch_ratio: 0.75 
+  consistency_batch_ratio: 0.25
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete" 
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  obs_encoder:
+    _target_: maniflow.model.vision_2d.timm_multimodal_encoder.TimmMultimodalEncoder
+    shape_meta: ${shape_meta}
+    
+    ##### RGB相机配置 (SigLIP) #####
+    model_name: 'vit_base_patch16_siglip_224'
+    pretrained: true
+    frozen: false
+    global_pool: ''
+    head_grid_size: 1  # 设置为1代表输出1个token（全局特征），设置为6代表输出6x6=36个tokens（保留更多空间信息）
+    feature_aggregation: 'avg' # 其他相机（如腕部）依然维持1个token
+    downsample_ratio: 32
+    
+    ##### 触觉传感器配置 - 仿真环境不使用，已注释 #####
+    # tactile_model_name: 'resnet18'
+    # tactile_pretrained: false
+    # tactile_frozen: false
+    # tactile_feature_dim: 768   # 与RGB特征维度一致（SigLIP base为768）
+    # tactile_num_kp: 32         # 🆕 SpatialSoftmax关键点数量（与robomimic一致）
+    # tactile_crop_shape: null   # 🆕 触觉裁剪尺寸，null表示不裁剪（可设为[56, 112]）
+    # share_tactile_model: true
+    # tactile_output_all_patches: false  # 改为false，每个触觉传感器每时间步输出1个token
+    
+    #####输出token序列模式 #####
+    output_token_sequence: true
+    
+    transforms:
+      - type: RandomCrop
+        ratio: 0.85
+      - _target_: torchvision.transforms.RandomRotation
+        degrees: [-5.0, 5.0]
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.4
+        contrast: 0.5
+        saturation: 0.5
+        hue: 0.08
+     
+    use_group_norm: false
+    share_rgb_model: false
+    imagenet_norm: true
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64      
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+# 🔥🔥🔥 优化器配置 - Gate参数免除Weight Decay实验 🔥🔥🔥
+# 核心改动：get_optim_groups 函数已自动将以下参数排除在weight_decay之外：
+#   1. cross_attn.q.weight / cross_attn.q.bias (生成gate score的核心)
+#   2. _modality_bias_tensor (模态特定的gate初始化偏置)
+#   3. 任何包含"gate"关键词的参数
+# 
+# 实验对比组：
+#   - 基线组（原始配置）: weight_decay=1.0e-4，所有参数都受惩罚
+#   - 实验组（本配置）: weight_decay=1.0e-4，但Gate参数被自动保护
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-4  # 🔥 保持相同的weight_decay值，但Gate参数会被自动排除
+
+training:
+  device: "cuda:0"
+  env_device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 301
+  gradient_accumulate_every: 1
+  use_wandb: true
+  max_grad_norm: 5.0
+  use_ema: True  
+  rollout_every: 100
+  checkpoint_every: 50
+  val_every: 50
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  
+  # 🔥🔥🔥 Head-Proprio融合策略后的模态Drop配置
+  # 设计理念：模拟真实机器人操作中的传感器失效场景，提升模型鲁棒性
+  # **重要变化：Proprio已融合进Head，Drop Head会同时Drop本体感知信息**
+  modality_drop:
+    enabled: true
+    head_drop: 0.1         # 20%概率Drop头部相机（**同时Drop融合的proprio信息**）
+    rgb_wrist_drop: 0.02   # 5%概率Drop腕部相机（近距离视角，不易遮挡）
+    # tactile_drop: 0.0    # 🔥 仿真环境无触觉，已移除
+    # proprio_drop: 0.5    # 🔥🔥🔥 已废弃：Proprio已融合进Head，不再作为独立参数
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${training.seed}_head_proprio_fusion_sim
+  project: ManiFlow_Image_GateAttn_Sim  # 🔥 修改项目名，区分仿真实验
+  resume: false
+  tags:
+  - ${logging.project}
+  - ditx_gateattn
+  - gate_attention
+  - vision_only        # 🔥 新增标签：纯视觉
+  - no_tactile         # 🔥 新增标签：无触觉
+  - sim                # 🔥 新增标签：仿真环境
+  - headwise_gate
+  - no_gate_decay      # 🔥 Gate参数免除weight decay实验
+  - head_proprio_fusion  # 🔥🔥🔥 新增标签：Head-Proprio融合策略
+
+checkpoint:
+  save_ckpt: True
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 1
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  
+  save_last_ckpt: True
+  save_last_snapshot: False
+  save_every: 50
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+checkpoint_num: 500
+expert_data_num: 50
+raw_task_name: none
+setting: none

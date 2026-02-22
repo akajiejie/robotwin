@@ -695,11 +695,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         if gate_stats:
             loss_dict.update(gate_stats)
             
-            # Add correlation metrics between loss and gate activations
+            # 🔥 Add correlation metrics between loss and gate activations (Head-Proprio融合后)
             # This helps understand if certain modalities are more important for reducing loss
             if 'gate/modality_tactile_mean' in gate_stats:
                 loss_dict['correlation/loss_vs_tactile_gate'] = loss_flow * gate_stats['gate/modality_tactile_mean']
-            if 'gate/modality_proprio_mean' in gate_stats:
-                loss_dict['correlation/loss_vs_proprio_gate'] = loss_flow * gate_stats['gate/modality_proprio_mean']
+            if 'gate/modality_head_mean' in gate_stats:
+                # Head现在包含融合的proprio信息
+                loss_dict['correlation/loss_vs_head_gate'] = loss_flow * gate_stats['gate/modality_head_mean']
+            # if 'gate/modality_proprio_mean' in gate_stats:  # 🔥 移除，已融合进head
+            #     loss_dict['correlation/loss_vs_proprio_gate'] = loss_flow * gate_stats['gate/modality_proprio_mean']
 
         return loss, loss_dict

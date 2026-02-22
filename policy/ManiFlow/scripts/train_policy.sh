@@ -23,8 +23,14 @@ export TOKENIZERS_PARALLELISM=false
 export HYDRA_FULL_ERROR=1
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 
+# 🔥 HuggingFace 缓存路径配置
+export HF_HOME="/shared_disk/models/huggingface"
+export HF_HUB_CACHE="/shared_disk/models/huggingface"
+export TORCH_HOME="/shared_disk/models/huggingface"
+export TRANSFORMERS_CACHE="/shared_disk/models/huggingface"
+
 # 🔥 启用HuggingFace离线模式 (使用本地缓存的预训练权重)
-# 注释掉离线模式,允许从HuggingFace下载预训练权重
+# 注释掉下面两行可允许从HuggingFace下载预训练权重
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 

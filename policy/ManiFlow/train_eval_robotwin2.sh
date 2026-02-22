@@ -46,6 +46,10 @@ fi
 # Evaluate the trained policy
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 export HYDRA_FULL_ERROR=1
+export HF_HOME="/shared_disk/models/huggingface"
+export HF_HUB_CACHE="/shared_disk/models/huggingface"
+export TORCH_HOME="/shared_disk/models/huggingface"
+export TRANSFORMERS_CACHE="/shared_disk/models/huggingface"
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 
 cd ../.. # move to root

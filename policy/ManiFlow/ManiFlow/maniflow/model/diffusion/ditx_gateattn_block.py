@@ -411,16 +411,17 @@ class DiTXGateAttnBlock(nn.Module):
         self.hidden_size = hidden_size
         self.gate_type = gate_type
         
-        # 模态特定的Gate Bias配置
+        # 🔥 模态特定的Gate Bias配置（Head-Proprio融合后）
         # 设计理念：让模型从"信任触觉"开始训练
-        # tactile: +0.5 -> sigmoid(0.5) = 0.62 (高初始权重)
-        # proprio: -0.5 -> sigmoid(-0.5) = 0.38 (低初始权重)
-        # head/rgb_wrist: 0.0 -> sigmoid(0.0) = 0.5 (中性)
+        # tactile: +1.5 -> sigmoid(1.5) = 0.82 (高初始权重)
+        # head: +1.0 -> sigmoid(1.0) = 0.73 (较高初始权重，因为包含融合的proprio)
+        # rgb_wrist: 0.0 -> sigmoid(0.0) = 0.5 (中性)
+        # 注意：proprio已融合进head，不再有独立的bias配置
         self.modality_bias_config = {
             'tactile': 1.5,
-            'proprio': -0.5,
-            'head': 1.0,
+            'head': 1.0,  # 🔥 包含融合的proprio信息
             'rgb_wrist': 0.0,
+            # 'proprio': -0.5,  # 🔥 移除，已融合进head
         }
 
         # Self-Attention with Flash Attention support
@@ -473,22 +474,25 @@ class DiTXGateAttnBlock(nn.Module):
         """
         设置模态token范围，并初始化gate bias
         
+        🔥 Head-Proprio融合后，modality_info格式为: {'head': L_head, 'rgb_wrist': L_wrist, 'tactile': L_tactile}
+        注意：'head'的tokens已包含融合的本体感知信息
+        
         Args:
-            modality_info: 来自encoder.get_modality_info(), 例如 {'head': 100, 'tactile': 4, 'proprio': 16}
+            modality_info: 来自encoder.get_modality_info(), 例如 {'head': 2, 'rgb_wrist': 4, 'tactile': 4}
         """
         if self.gate_type == 'none':
             return
         
         ranges = {}
         start = 0
-        for modality in ['head', 'rgb_wrist', 'tactile', 'proprio']:
+        for modality in ['head', 'rgb_wrist', 'tactile']:  # 🔥 移除'proprio'
             if modality in modality_info and modality_info[modality] > 0:
                 num_tokens = modality_info[modality]
                 ranges[modality] = (start, start + num_tokens)
                 start += num_tokens
         
         self.cross_attn.set_modality_gate_bias(ranges, self.modality_bias_config)
-        # logger.info(f"[DiTXGateAttnBlock] 模态范围已设置: {ranges}")
+        # logger.info(f"[DiTXGateAttnBlock] 模态范围已设置 (Head含Proprio): {ranges}")
     
     def update_modality_bias_config(self, **kwargs):
         """

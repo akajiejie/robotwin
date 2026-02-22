@@ -30,3 +30,4 @@ envs/curobo/*
 /*.txt
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
+third_party/*

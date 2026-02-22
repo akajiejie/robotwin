@@ -349,14 +349,15 @@ class DiTXGateAttn(nn.Module):
             logger.warning("[DiTXGateAttn] modality_info为None，跳过位置编码初始化")
             return
         
-        # 计算token组织: [head, rgb_wrist, tactile, proprio]
+        # 🔥 计算token组织: [head (含proprio), rgb_wrist, tactile]
+        # 注意：Head tokens已融合本体感知信息，不再有独立的proprio tokens
         start_idx = 0
         pos_embed_data = self.vis_cond_pos_embed.data  # (1, L_total, n_emb)
         L_total = pos_embed_data.shape[1]
         embed_dim = pos_embed_data.shape[2]
         
         cprint(f"[DiTXGateAttn] 开始初始化位置编码: L_total={L_total}, embed_dim={embed_dim}", 'cyan')
-        cprint(f"[DiTXGateAttn] 模态信息: {modality_info}", 'cyan')
+        cprint(f"[DiTXGateAttn] 模态信息 (Head已融合Proprio): {modality_info}", 'cyan')
         
         # === 1. Head相机: 2D Sin-Cos编码 ===
         if 'head' in modality_info and modality_info['head'] > 0:
@@ -444,19 +445,7 @@ class DiTXGateAttn(nn.Module):
             cprint(f"[Tactile] ✓ 1D位置编码已注入: tokens [{start_idx}:{start_idx + n_tactile_tokens}]", 'green')
             start_idx += n_tactile_tokens
         
-        # === 4. Proprio: 1D Sin-Cos编码 ===
-        if 'proprio' in modality_info and modality_info['proprio'] > 0:
-            n_proprio_tokens = modality_info['proprio']
-            cprint(f"[Proprio] 使用1D Sin-Cos编码: {n_proprio_tokens} tokens", 'green')
-            
-            pos_embed_1d = get_1d_sincos_pos_embed_from_grid(
-                embed_dim=embed_dim,
-                pos=np.arange(n_proprio_tokens, dtype=np.float32),
-                temperature=10000.0
-            )
-            pos_embed_data[0, start_idx:start_idx + n_proprio_tokens, :] = torch.from_numpy(pos_embed_1d).float()
-            cprint(f"[Proprio] ✓ 1D位置编码已注入: tokens [{start_idx}:{start_idx + n_proprio_tokens}]", 'green')
-            start_idx += n_proprio_tokens
+        # 🔥 Proprio已融合进Head，不再需要独立的位置编码
         
         # 验证所有token都被覆盖
         if start_idx != L_total:
@@ -820,16 +809,15 @@ class DiTXGateAttn(nn.Module):
         # === 3. Modality-level Attention (使用实际的token组织) ===
         if modality_info is not None:
             # 🔥 Token组织方式（来自TimmMultimodalEncoder._forward_token_sequence）:
-            # [head tokens, rgb_wrist tokens, tactile tokens, proprio tokens]
-            # 例如: [head×2, wrist×4, tactile×4, proprio×2] = 12 tokens
+            # [head tokens (已融合proprio), rgb_wrist tokens, tactile tokens]
+            # 例如: [head×2 (含proprio), wrist×4, tactile×4] = 10 tokens
             
             start_idx = 0
             head_attn = 0.0
             wrist_attn = 0.0
             tactile_attn = 0.0
-            proprio_attn = 0.0
             
-            # Head相机
+            # Head相机（已融合本体感知）
             if 'head' in modality_info and modality_info['head'] > 0:
                 n_head = modality_info['head']
                 head_attn = attn_avg[start_idx:start_idx + n_head].sum().item()
@@ -847,24 +835,20 @@ class DiTXGateAttn(nn.Module):
                 tactile_attn = attn_avg[start_idx:start_idx + n_tactile].sum().item()
                 start_idx += n_tactile
             
-            # 本体感知
-            if 'proprio' in modality_info and modality_info['proprio'] > 0:
-                n_proprio = modality_info['proprio']
-                proprio_attn = attn_avg[start_idx:start_idx + n_proprio].sum().item()
-                start_idx += n_proprio
+            # 🔥 Proprio已融合进Head，不再有独立的注意力统计
             
             # 聚合RGB = head + wrist
             rgb_attn = head_attn + wrist_attn
             
             # 保存统计信息
             stats['modality_rgb'] = rgb_attn
-            stats['modality_head'] = head_attn
+            stats['modality_head'] = head_attn  # 🔥 包含融合的proprio信息
             stats['modality_wrist'] = wrist_attn
             stats['modality_tactile'] = tactile_attn
-            stats['modality_proprio'] = proprio_attn
+            # stats['modality_proprio'] = proprio_attn  # 🔥 移除，已融合进head
             
             # 验证总和约为1.0
-            total_attn = rgb_attn + tactile_attn + proprio_attn
+            total_attn = rgb_attn + tactile_attn  # 🔥 移除proprio_attn
             if abs(total_attn - 1.0) > 0.01:
                 logger.warning(f"注意力总和偏离1.0: {total_attn:.4f}")
         

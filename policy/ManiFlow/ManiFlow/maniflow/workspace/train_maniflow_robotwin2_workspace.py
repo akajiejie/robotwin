@@ -363,13 +363,14 @@ class TrainManiFlowRoboTwinWorkspace:
                                     step_log['attn/entropy'] = attn_stats['entropy']
                                     step_log['attn/entropy_diff'] = attn_stats['entropy_early_late_diff']
                                     
-                                    # Modality attention (if modality_info is available)
+                                    # 🔥 Modality attention (Head-Proprio融合后)
+                                    # 注意：'modality_head'现在包含融合的proprio信息
                                     if 'modality_rgb' in attn_stats:
                                         step_log['attn/modality_rgb'] = attn_stats['modality_rgb']
-                                        step_log['attn/modality_head'] = attn_stats.get('modality_head', 0.0)
+                                        step_log['attn/modality_head'] = attn_stats.get('modality_head', 0.0)  # 包含proprio
                                         step_log['attn/modality_wrist'] = attn_stats.get('modality_wrist', 0.0)
-                                        step_log['attn/modality_tactile'] = attn_stats['modality_tactile']
-                                        step_log['attn/modality_proprio'] = attn_stats['modality_proprio']
+                                        step_log['attn/modality_tactile'] = attn_stats.get('modality_tactile', 0.0)
+                                        # step_log['attn/modality_proprio'] = attn_stats['modality_proprio']  # 🔥 移除，已融合进head
                                 
                                 # Disable attention recording
                                 self.model.set_record_attn(False)

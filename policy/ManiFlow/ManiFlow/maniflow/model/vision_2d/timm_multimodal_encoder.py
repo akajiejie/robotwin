@@ -324,14 +324,17 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         self.output_token_sequence = output_token_sequence
         if output_token_sequence:
             cprint(f"✓ 启用token序列输出模式 (用于模态级MoE)", 'cyan')
-            # 创建本体感知投影层（将低维状态投影到RGB特征维度）
+            # 🔥 Head-Proprio融合策略：将本体感知融合进Head Camera的Token
             if len(low_dim_keys) > 0:
                 total_low_dim = sum(key_shape_map[k][0] if len(key_shape_map[k]) == 1 
                                   else key_shape_map[k][-1] for k in low_dim_keys)
-                self.proprio_proj = nn.Linear(total_low_dim, rgb_feature_dim)
-                nn.init.xavier_uniform_(self.proprio_proj.weight)
-                nn.init.zeros_(self.proprio_proj.bias)
-                cprint(f"  ✓ 本体感知投影层: {total_low_dim} -> {rgb_feature_dim}", 'green')
+                
+                # 创建融合投影层：[rgb_dim + low_dim] -> rgb_dim
+                self.head_proprio_fusion = nn.Linear(rgb_feature_dim + total_low_dim, rgb_feature_dim)
+                nn.init.xavier_uniform_(self.head_proprio_fusion.weight)
+                nn.init.zeros_(self.head_proprio_fusion.bias)
+                cprint(f"  ✓ Head-Proprio融合层: ({rgb_feature_dim} + {total_low_dim}) -> {rgb_feature_dim}", 'cyan')
+                cprint(f"  ✓ 本体感知将被融合进Head Camera的Token（强制视觉关注）", 'yellow')
         
         # 🆕 Head相机空间降采样配置
         self.head_grid_size = head_grid_size
@@ -634,17 +637,17 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         """
         🆕 输出token序列格式: (B, L_tokens, D)
         
-        模态组织策略（各模态独立输出，支持模态Drop）:
-        - head: head_cam tokens (可被Drop，模拟遮挡场景)
+        🔥 Head-Proprio融合策略（强制视觉关注）:
+        - head: head_cam tokens **融合本体感知** (物理绑定，强制模型处理视觉)
         - rgb_wrist: left_wrist_cam + right_wrist_cam tokens (低Drop率，近距离视角重要)
         - tactile: left_tactile + right_tactile tokens (极低Drop率，接触信息关键)
-        - proprio: agent_pos tokens (可被Drop，强制学习视觉-触觉依赖)
+        - proprio: **不再作为独立Token输出**，已融合进head tokens
         
         Drop策略设计理念:
         - Head相机: 在实际操作中容易被机械臂遮挡 → 高Drop率模拟遮挡
         - Wrist相机: 近距离视角，不易遮挡 → 低Drop率
         - Tactile: 接触时的关键信息 → 极低/不Drop
-        - Proprio: 可能存在编码器噪声 → 中等Drop率
+        - Proprio: 通过融合进Head实现Drop（当Head被Drop时，Proprio也被Drop）
         
         Args:
             obs_dict: 观测字典
@@ -702,24 +705,56 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
                     # output_all_patches=False: (B, T, D) - 保留所有时间步，每个时间步1个token
                     tactile_tokens_list.append(tact_tok)
         
-        # ============ 处理低维状态（本体感知） ============
+        # ============ 处理低维状态（本体感知） - 收集用于融合 ============
         for key in self.low_dim_keys:
             data = obs_dict[key].to(self.device)
             B, T = data.shape[:2]
             assert B == batch_size
             proprio_features_list.append(data)  # (B, T, low_dim)
         
+        # ============ 🔥 Head-Proprio融合（强制视觉关注） ============
+        if head_tokens_list and proprio_features_list:
+            # 1. 拼接所有本体感知特征
+            proprio_concat = torch.cat(proprio_features_list, dim=-1)  # (B, T, total_low_dim)
+            
+            # 2. 拼接所有Head tokens
+            head_tokens = torch.cat(head_tokens_list, dim=1)  # (B, n_head_cams*T*N, D)
+            
+            # 3. 广播proprio到与head tokens相同的空间维度
+            # head_tokens: (B, T*N, D) 其中 N = head_grid_size^2 (每个时间步的token数)
+            # proprio_concat: (B, T, low_dim)
+            # 需要将proprio在空间维度上复制N次
+            
+            num_head_tokens = head_tokens.shape[1]  # T*N
+            tokens_per_timestep = num_head_tokens // time_steps  # N
+            
+            # 将proprio复制N次: (B, T, low_dim) -> (B, T*N, low_dim)
+            proprio_expanded = proprio_concat.unsqueeze(2).repeat(1, 1, tokens_per_timestep, 1)  # (B, T, N, low_dim)
+            proprio_expanded = proprio_expanded.reshape(B, num_head_tokens, -1)  # (B, T*N, low_dim)
+            
+            # 4. 拼接head tokens和proprio: (B, T*N, D + low_dim)
+            fused_features = torch.cat([head_tokens, proprio_expanded], dim=-1)
+            
+            # 5. 投影回原始维度: (B, T*N, D + low_dim) -> (B, T*N, D)
+            head_tokens_fused = self.head_proprio_fusion(fused_features.float())
+            
+        elif head_tokens_list:
+            # 如果没有proprio，直接使用head tokens
+            head_tokens_fused = torch.cat(head_tokens_list, dim=1)
+        else:
+            head_tokens_fused = None
+        
         # ============ 组装最终的token序列（应用模态Drop） ============
         all_tokens = []
-        modality_info = {'head': 0, 'rgb_wrist': 0, 'tactile': 0, 'proprio': 0}
+        modality_info = {'head': 0, 'rgb_wrist': 0, 'tactile': 0}  # 🔥 移除'proprio'键
         
-        # 🔥 Head tokens (高Drop率 - 模拟被机械臂遮挡的场景)
+        # 🔥 Head tokens (已融合本体感知，高Drop率 - 模拟被机械臂遮挡的场景)
         # 实际操作中，头部相机经常被机械臂遮挡，模型需要学会在遮挡时依赖腕部相机和触觉
-        if head_tokens_list:
-            head_tokens = torch.cat(head_tokens_list, dim=1)  # (B, n_head_cams*T, D)
-            head_tokens = self._apply_modality_drop(head_tokens, 'head')
-            all_tokens.append(head_tokens)
-            modality_info['head'] = head_tokens.shape[1]
+        # 注意：当Head被Drop时，融合在其中的Proprio信息也会被Drop
+        if head_tokens_fused is not None:
+            head_tokens_fused = self._apply_modality_drop(head_tokens_fused, 'head')
+            all_tokens.append(head_tokens_fused)
+            modality_info['head'] = head_tokens_fused.shape[1]
         
         # 🔥 RGB Wrist tokens (低Drop率 - 近距离视角，不易遮挡)
         # 腕部相机贴近操作物体，提供关键的近距离视觉信息
@@ -737,15 +772,6 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             all_tokens.append(tactile_tokens)
             modality_info['tactile'] = tactile_tokens.shape[1]
         
-        # 🔥 Proprio tokens (中等Drop率 - 强制学习视觉-触觉依赖)
-        # 本体感知可能存在编码器噪声，Drop后强制模型从视觉和触觉推断位置
-        if proprio_features_list:
-            proprio_concat = torch.cat(proprio_features_list, dim=-1)  # (B, T, total_low_dim)
-            proprio_tokens = self.proprio_proj(proprio_concat.float())  # (B, T, D)
-            proprio_tokens = self._apply_modality_drop(proprio_tokens, 'proprio')
-            all_tokens.append(proprio_tokens)
-            modality_info['proprio'] = proprio_tokens.shape[1]
-        
         result = torch.cat(all_tokens, dim=1)  # (B, L_total, D)
         
         # 保存模态信息供外部使用
@@ -757,8 +783,11 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         """
         🆕 获取最近一次forward的模态长度信息
         
+        🔥 Head-Proprio融合后，返回格式为: {'head': L_head, 'rgb_wrist': L_wrist, 'tactile': L_tactile}
+        注意：'head'的tokens已包含融合的本体感知信息，不再有独立的'proprio'键
+        
         Returns:
-            modality_info: dict {'head': L_head, 'wrist': L_wrist, 'proprio': L_proprio}
+            modality_info: dict {'head': L_head, 'rgb_wrist': L_wrist, 'tactile': L_tactile}
         """
         return getattr(self, '_last_modality_info', None)
     
@@ -768,24 +797,27 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         
         设计理念：模拟真实机器人操作中的传感器失效场景
         - Head相机: 容易被机械臂遮挡 → 建议高Drop率 (0.2-0.3)
+          **注意：Head-Proprio融合后，Drop Head相机会同时Drop本体感知信息**
         - Wrist相机: 近距离视角，不易遮挡 → 建议低Drop率 (0.05-0.1)
         - Tactile: 接触信息关键 → 建议极低/不Drop (0.0-0.02)
-        - Proprio: 可能有编码器噪声 → 建议中等Drop率 (0.1-0.15)
+        - Proprio: **已融合进Head，不再作为独立参数（保留接口兼容性）**
         
         Args:
-            head_drop: Head相机的drop概率 (0.0-1.0)
+            head_drop: Head相机的drop概率 (0.0-1.0)，会同时影响融合的proprio
             rgb_wrist_drop: Wrist相机的drop概率 (0.0-1.0)
             tactile_drop: Tactile传感器的drop概率 (0.0-1.0)
-            proprio_drop: Proprio的drop概率 (0.0-1.0)
+            proprio_drop: **已废弃**，保留参数仅为向后兼容
         """
         self.modality_drop_config = {
             'head': head_drop,
             'rgb_wrist': rgb_wrist_drop,
             'tactile': tactile_drop,
-            'proprio': proprio_drop,
+            # 'proprio': proprio_drop,  # 🔥 移除，已融合进head
         }
-        cprint(f"✓ 模态Drop配置已更新: head={head_drop}, rgb_wrist={rgb_wrist_drop}, "
-               f"tactile={tactile_drop}, proprio={proprio_drop}", 'yellow')
+        if proprio_drop > 0.0:
+            cprint(f"⚠️  警告: proprio_drop参数已废弃（Proprio已融合进Head），将被忽略", 'yellow')
+        cprint(f"✓ 模态Drop配置已更新: head={head_drop} (含proprio), rgb_wrist={rgb_wrist_drop}, "
+               f"tactile={tactile_drop}", 'yellow')
     
     def _apply_modality_drop(self, tokens, modality_name):
         """
