@@ -94,7 +94,6 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             tactile_crop_shape: Optional[Union[Tuple[int, int], Dict[str, Tuple[int, int]]]]=None,  # 🆕 触觉裁剪尺寸
             share_tactile_model: bool=False,
             tactile_output_all_patches: bool=False,  # 🔥 触觉是否输出所有patch tokens
-            # 🆕 模态级MoE支持
             output_token_sequence: bool=False,
             head_grid_size: int=1,  # 🔥 Head相机的空间重采样网格大小 (NxN), 默认1=单token
         ):
@@ -114,7 +113,7 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             tactile_crop_shape: 触觉图像裁剪尺寸，可选
             share_tactile_model: 是否在多个触觉传感器间共享权重
             tactile_output_all_patches: 触觉是否输出所有patch tokens
-            output_token_sequence: 是否输出token序列格式（用于模态级MoE）
+            output_token_sequence: 是否输出token序列格式
             head_grid_size: Head相机的输出token网格大小，生成 head_grid_size^2 个tokens
         """
         super().__init__()
@@ -320,10 +319,9 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         self.share_rgb_model = share_rgb_model
         self.share_tactile_model = share_tactile_model
         
-        # 🆕 模态级MoE支持
         self.output_token_sequence = output_token_sequence
         if output_token_sequence:
-            cprint(f"✓ 启用token序列输出模式 (用于模态级MoE)", 'cyan')
+            cprint(f"✓ 启用token序列输出模式", 'cyan')
             # 🔥 Head-Proprio融合策略：将本体感知融合进Head Camera的Token
             if len(low_dim_keys) > 0:
                 total_low_dim = sum(key_shape_map[k][0] if len(key_shape_map[k]) == 1 
@@ -569,7 +567,7 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
         """
         batch_size = next(iter(obs_dict.values())).shape[0]
         
-        # 🆕 Token序列模式（用于模态级MoE）
+        # 🆕 Token序列模式
         if self.output_token_sequence:
             return self._forward_token_sequence(obs_dict, batch_size)
         
@@ -943,7 +941,7 @@ if __name__ == '__main__':
     
     # 创建token序列输出模式的编码器
     cprint("\n" + "="*80, "cyan")
-    cprint("测试token序列输出模式（用于模态级MoE）", "cyan", attrs=["bold"])
+    cprint("测试token序列输出模式", "cyan", attrs=["bold"])
     cprint("="*80, "cyan")
     
     encoder_token_seq = TimmMultimodalEncoder(
