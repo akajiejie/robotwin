@@ -12,15 +12,7 @@ from maniflow.common.model_util import print_params
 from maniflow.model.vision_2d.timm_obs_encoder import TimmObsEncoder
 from maniflow.model.diffusion.ditx import DiTX
 from maniflow.model.common.sample_util import *
-
-# Optional import for Gate-Attention support
-try:
-    from maniflow.model.diffusion.ditx_gateattn import DiTXGateAttn
-    GATE_ATTN_AVAILABLE = True
-except ImportError:
-    GATE_ATTN_AVAILABLE = False
-    DiTXGateAttn = None
-    cprint("[Warning] DiTXGateAttn not available, falling back to DiTX", "yellow")
+from maniflow.model.diffusion.ditx_gateattn import DiTXGateAttn
 
 
 
