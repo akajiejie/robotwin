@@ -398,7 +398,7 @@ _CONFIGS = [
     ),
     # pi0_fast_base by lora
     TrainConfig(
-        name="pi0_fingle_fast_aloha_lora",
+        name="pi0_fast_aloha_lora",
         model=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora"),
         data=LeRobotLiberoDataConfig(
             repo_id="your_repo_id",# your datasets repo_id
@@ -460,7 +460,7 @@ _CONFIGS = [
         name="pi0_base_aloha_robotwin_lora",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAlohaDataConfig(
-            repo_id="stack_bowls_100",  # your datasets repo_id
+            repo_id="fruit_transfer",  # your datasets repo_id
             adapt_to_pi=False,
             repack_transforms=_transforms.Group(inputs=[
                 _transforms.RepackTransform({
