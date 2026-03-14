@@ -36,19 +36,18 @@ policy:
   # 🔥 TimmMultimodalEncoder 在 output_token_sequence=True 模式下的输出：
   #    输出格式: (B, L_total, D)，其中 L_total = 所有模态的token数（已展开时间步）
   #    
-  #    Token组织结构（按模态分组，每个模态内按时间步排列）：
-  #    - head模态 (head_grid_size=6):  [head_t0_tokens(36个), head_t1_tokens(36个)] = 72 tokens
+  #    Token组织结构（按模态分组，Proprio已融合进Head）：
+  #    - head模态 (head_grid_size=1):  [head_t0(1个), head_t1(1个)] = 2 tokens（含融合的proprio）
   #    - rgb_wrist模态: [L_wrist_t0, L_wrist_t1, R_wrist_t0, R_wrist_t1] = 4 tokens
   #    - tactile模态:   [L_tactile_t0, L_tactile_t1, R_tactile_t0, R_tactile_t1] = 4 tokens
-  #    - proprio模态:   [proprio_t0, proprio_t1]             = 2 tokens
   #    
-  #    总token数: L_total = 72 + 4 + 4 + 2 = 82 (当head_grid_size=6时)
+  #    总token数: L_total = 2 + 4 + 4 = 10 (当head_grid_size=1时)
   #    
   # 🔥 DiTX位置编码配置:
   #    self.vis_cond_pos_embed = nn.Parameter(torch.zeros(1, visual_cond_len * n_obs_steps, n_emb))
   #    所以需要: visual_cond_len × n_obs_steps = L_total
-  #    即: visual_cond_len = L_total / n_obs_steps = 82 / 2 = 41
-  visual_cond_len: 21  # 每个时间步的模态token数（DiTX内部会 × n_obs_steps = 2 得到82个位置编码）
+  #    即: visual_cond_len = L_total / n_obs_steps = 10 / 2 = 5
+  visual_cond_len: 5  # 每个时间步的模态token数（DiTX内部会 × n_obs_steps = 2 得到10个位置编码）
   
   max_lang_cond_len: 1024
   qkv_bias: true
@@ -81,7 +80,7 @@ policy:
     pretrained: true
     frozen: false
     global_pool: ''
-    head_grid_size: 4  # 设置为6代表输出6x6=36个tokens（保留更多空间信息）
+    head_grid_size: 1 
     feature_aggregation: 'avg' # 其他相机（如腕部）依然维持1个token
     downsample_ratio: 32
     
@@ -123,14 +122,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 112      
+  batch_size: 64      
   num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
-  batch_size: 112
+  batch_size: 64
   num_workers: 4
   shuffle: False
   pin_memory: True
@@ -176,10 +175,10 @@ training:
   # 模态Drop配置（训练时数据增强，推理时自动关闭）
   # 设计理念：模拟真实机器人操作中的传感器失效场景，提升模型鲁棒性
   modality_drop:
-    head_drop: 0.2         # 20%概率Drop头部相机（模拟被机械臂遮挡）
-    rgb_wrist_drop: 0.05   # 5%概率Drop腕部相机（近距离视角，不易遮挡）
+    head_drop: 0.0         # 20%概率Drop头部相机（模拟被机械臂遮挡）
+    rgb_wrist_drop: 0.0   # 5%概率Drop腕部相机（近距离视角，不易遮挡）
     tactile_drop: 0.0      # 保留触觉（接触信息是兜底保障）
-    proprio_drop: 0.2      # 20%概率Drop本体感知（强制学习视觉-触觉依赖）
+    proprio_drop: 0.0      # 20%概率Drop本体感知（强制学习视觉-触觉依赖）
 
 logging:
   group: ${exp_name}

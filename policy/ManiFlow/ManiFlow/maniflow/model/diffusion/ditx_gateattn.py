@@ -471,16 +471,21 @@ class DiTXGateAttn(nn.Module):
                 if block.self_attn.proj.bias is not None:
                     nn.init.zeros_(block.self_attn.proj.bias)
             
-            # Initialize CrossAttention (q and kv projections)
+            # Initialize CrossAttention (q, k, v projections)
             if hasattr(block.cross_attn, 'q'):
                 nn.init.xavier_uniform_(block.cross_attn.q.weight)
                 if block.cross_attn.q.bias is not None:
                     nn.init.zeros_(block.cross_attn.q.bias)
             
-            if hasattr(block.cross_attn, 'kv'):
-                nn.init.xavier_uniform_(block.cross_attn.kv.weight)
-                if block.cross_attn.kv.bias is not None:
-                    nn.init.zeros_(block.cross_attn.kv.bias)
+            if hasattr(block.cross_attn, 'k'):
+                nn.init.xavier_uniform_(block.cross_attn.k.weight)
+                if block.cross_attn.k.bias is not None:
+                    nn.init.zeros_(block.cross_attn.k.bias)
+            
+            if hasattr(block.cross_attn, 'v'):
+                nn.init.xavier_uniform_(block.cross_attn.v.weight)
+                if block.cross_attn.v.bias is not None:
+                    nn.init.zeros_(block.cross_attn.v.bias)
             
             # Initialize cross-attention output projection
             if hasattr(block.cross_attn, 'proj'):
@@ -731,7 +736,13 @@ class DiTXGateAttn(nn.Module):
             global_stats[f'gate/modality_{modality}_std'] = np.std(values)
         
         return global_stats
-    
+
+    def clear_gate_stats_buffer(self):
+        """清空所有 blocks 的 gate 统计缓存"""
+        for block in self.blocks:
+            if hasattr(block, 'clear_gate_stats_buffer'):
+                block.clear_gate_stats_buffer()
+
     # ========= Attention Weight Recording =========
     def set_record_attn(self, record: bool):
         """Enable/disable cross-attention weight recording for all blocks"""

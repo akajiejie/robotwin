@@ -72,10 +72,6 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         
         # 根据use_gate_attn选择模型类型
         if use_gate_attn:
-            if not GATE_ATTN_AVAILABLE:
-                raise ImportError(
-                    "DiTXGateAttn is not available. Please check if ditx_gateattn.py is properly installed."
-                )
             cprint(f"[ManiFlowTransformerImagePolicy] 使用DiTXGateAttn模型 (gate_type={gate_type})", "cyan")
             model = DiTXGateAttn(
                 input_dim=input_dim,
@@ -219,7 +215,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
     def get_gate_stats(self):
         """
         Get Gate-Attention statistics from DiTXGateAttn model
-        
+
         Returns:
             dict: Global gate statistics including:
                 - gate/mean_activation: Average gate activation across all layers
@@ -232,7 +228,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         if hasattr(self.model, 'get_gate_stats'):
             return self.model.get_gate_stats()
         return None
-        
+
+    def clear_gate_stats_buffer(self):
+        """清空 gate 统计缓存，避免多次 forward pass 导致统计污染"""
+        if hasattr(self.model, 'clear_gate_stats_buffer'):
+            self.model.clear_gate_stats_buffer()
+
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, 
@@ -619,82 +620,128 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         """Get flow and consistency targets"""
         flow_batchsize = int(batch_size * self.flow_batch_ratio)
         consistency_batchsize = int(batch_size * self.consistency_batch_ratio)
+        # 防止 int() 向下取整导致某个分支 batch_size=0
+        if batch_size >= 2:
+            flow_batchsize = max(flow_batchsize, 1)
+            consistency_batchsize = max(consistency_batchsize, 1)
+            # 确保总数不超过 batch_size
+            if flow_batchsize + consistency_batchsize > batch_size:
+                flow_batchsize = batch_size - consistency_batchsize
+        else:
+            # batch_size=1 时只跑 flow，跳过 consistency
+            flow_batchsize = batch_size
+            consistency_batchsize = 0
     
 
-        # Get flow targets
-        flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize], 
-                                                    vis_cond=vis_cond[:flow_batchsize],
-                                                    lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None)
+        # 清空 gate 统计缓存，确保统计信息不被污染
+        self.clear_gate_stats_buffer()
+
+        # Get flow targets and forward pass
+        flow_target_dict = self.get_flow_velocity(
+            nactions[:flow_batchsize],
+            vis_cond=vis_cond[:flow_batchsize],
+            lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None,
+        )
         v_flow_pred = self.model(
-            sample=flow_target_dict['x_t'], 
+            sample=flow_target_dict['x_t'],
             timestep=flow_target_dict['t'].squeeze(),
             target_t=flow_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[:flow_batchsize],
             lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
             modality_info=modality_info,
-            head_grid_size=head_grid_size)
+            head_grid_size=head_grid_size,
+        )
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
-        # Get consistency targets
-        consistency_target_dict = self.get_consistency_velocity(nactions[flow_batchsize:flow_batchsize+consistency_batchsize],
-                                                                        vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-                                                                        lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-                                                                        ema_model=ema_model,
-                                                                        modality_info=modality_info,
-                                                                        head_grid_size=head_grid_size
-                                                                        )
-        v_ct_pred = self.model(
-            sample=consistency_target_dict['x_t'], 
-            timestep=consistency_target_dict['t'].squeeze(),
-            target_t=consistency_target_dict['target_t'].squeeze(),
-            vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-            lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-            modality_info=modality_info,
-            head_grid_size=head_grid_size)
-        v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
+        # 收集 flow forward pass 的 gate 统计并清空缓存
+        flow_gate_stats = self.get_gate_stats()
+        self.clear_gate_stats_buffer()
 
-        """Compute losses"""
-        loss = 0.
+        # Get consistency targets and forward pass (skip when consistency_batchsize=0)
+        ct_gate_stats = None
+        if consistency_batchsize > 0:
+            consistency_target_dict = self.get_consistency_velocity(
+                nactions[flow_batchsize:flow_batchsize + consistency_batchsize],
+                vis_cond=vis_cond[flow_batchsize:flow_batchsize + consistency_batchsize],
+                lang_cond=lang_cond[flow_batchsize:flow_batchsize + consistency_batchsize] if lang_cond is not None else None,
+                ema_model=ema_model,
+                modality_info=modality_info,
+                head_grid_size=head_grid_size,
+            )
+            v_ct_pred = self.model(
+                sample=consistency_target_dict['x_t'],
+                timestep=consistency_target_dict['t'].squeeze(),
+                target_t=consistency_target_dict['target_t'].squeeze(),
+                vis_cond=vis_cond[flow_batchsize:flow_batchsize + consistency_batchsize],
+                lang_cond=lang_cond[flow_batchsize:flow_batchsize + consistency_batchsize] if lang_cond is not None else None,
+                modality_info=modality_info,
+                head_grid_size=head_grid_size,
+            )
+            v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
 
-        # compute flow loss 
+            # 收集 consistency forward pass 的 gate 统计并清空缓存
+            ct_gate_stats = self.get_gate_stats()
+            self.clear_gate_stats_buffer()
+
+        # Compute losses
         v_flow_target = flow_target_dict['v_target']
         loss_flow = F.mse_loss(v_flow_pred, v_flow_target, reduction='none')
         loss_flow = reduce(loss_flow, 'b ... -> b (...)', 'mean')
-        loss += loss_flow.mean()
-        loss_flow = loss_flow.mean().item()
+        loss_flow_tensor = loss_flow.mean()
+        loss_flow_value = loss_flow_tensor.item()
 
-        # compute consistency training loss
-        v_ct_target = consistency_target_dict['v_target']
-        loss_ct = F.mse_loss(v_ct_pred, v_ct_target, reduction='none')
-        loss_ct = reduce(loss_ct, 'b ... -> b (...)', 'mean')
-        loss += loss_ct.mean()
-        loss_ct = loss_ct.mean().item()  
+        if consistency_batchsize > 0:
+            v_ct_target = consistency_target_dict['v_target']
+            loss_ct = F.mse_loss(v_ct_pred, v_ct_target, reduction='none')
+            loss_ct = reduce(loss_ct, 'b ... -> b (...)', 'mean')
+            loss_ct_tensor = loss_ct.mean()
+            loss_ct_value = loss_ct_tensor.item()
+            loss = loss_flow_tensor + loss_ct_tensor
+        else:
+            loss_ct_tensor = torch.tensor(0.0, device=self.device)
+            loss_ct_value = 0.0
+            v_ct_pred_magnitude = 0.0
+            loss = loss_flow_tensor
 
-        loss = loss.mean()
-        
-        # Get gate statistics if available (for Gate-Attention models)
-        gate_stats = self.get_gate_stats()
-        
         loss_dict = {
-                'loss_flow': loss_flow,
-                'loss_ct': loss_ct,
-                'v_flow_pred_magnitude': v_flow_pred_magnitude,
-                'v_ct_pred_magnitude': v_ct_pred_magnitude,
-                'bc_loss': loss.item(),
+            'loss_flow': loss_flow_value,
+            'loss_ct': loss_ct_value,
+            'v_flow_pred_magnitude': v_flow_pred_magnitude,
+            'v_ct_pred_magnitude': v_ct_pred_magnitude,
+            'bc_loss': loss.item(),
         }
-        
-        # Add gate statistics to loss_dict if available
+
+        # 合并 flow 和 consistency 的 gate 统计（加权平均）
+        gate_stats = self._merge_gate_stats(flow_gate_stats, ct_gate_stats)
         if gate_stats:
             loss_dict.update(gate_stats)
-            
-            # 🔥 Add correlation metrics between loss and gate activations (Head-Proprio融合后)
-            # This helps understand if certain modalities are more important for reducing loss
-            if 'gate/modality_tactile_mean' in gate_stats:
-                loss_dict['correlation/loss_vs_tactile_gate'] = loss_flow * gate_stats['gate/modality_tactile_mean']
-            if 'gate/modality_head_mean' in gate_stats:
-                # Head现在包含融合的proprio信息
-                loss_dict['correlation/loss_vs_head_gate'] = loss_flow * gate_stats['gate/modality_head_mean']
-            # if 'gate/modality_proprio_mean' in gate_stats:  # 🔥 移除，已融合进head
-            #     loss_dict['correlation/loss_vs_proprio_gate'] = loss_flow * gate_stats['gate/modality_proprio_mean']
 
         return loss, loss_dict
+
+    def _merge_gate_stats(self, flow_stats, ct_stats):
+        """
+        合并 flow 和 consistency forward pass 的 gate 统计信息。
+
+        Args:
+            flow_stats: flow forward pass 的 gate 统计
+            ct_stats: consistency forward pass 的 gate 统计
+
+        Returns:
+            dict: 合并后的统计信息（取平均值）
+        """
+        if flow_stats is None and ct_stats is None:
+            return None
+
+        if flow_stats is None:
+            return ct_stats
+        if ct_stats is None:
+            return flow_stats
+
+        merged = {}
+        all_keys = set(flow_stats.keys()) | set(ct_stats.keys())
+        for key in all_keys:
+            flow_val = flow_stats.get(key, 0.0)
+            ct_val = ct_stats.get(key, 0.0)
+            merged[key] = (flow_val + ct_val) / 2.0
+
+        return merged
