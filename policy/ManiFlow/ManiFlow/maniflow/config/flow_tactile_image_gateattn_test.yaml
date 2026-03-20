@@ -4,7 +4,7 @@ defaults:
 name: train_maniflow_tactile_image_policy_gateattn_no_gate_decay
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "flow_tactile_image_gateattn_no_gate_decay"
+exp_name: "flow_tactile_image_gateattn_test"
 
 horizon: 32
 n_obs_steps: 2
@@ -88,26 +88,17 @@ policy:
     tactile_model_name: 'resnet18'
     tactile_pretrained: false
     tactile_frozen: false
-    tactile_feature_dim: 768   # 与RGB特征维度一致（SigLIP base为768）
-    tactile_num_kp: 32         # 🆕 SpatialSoftmax关键点数量（与robomimic一致）
-    tactile_crop_shape: null   # 🆕 触觉裁剪尺寸，null表示不裁剪（可设为[56, 112]）
+    tactile_feature_dim: 768
+    tactile_num_kp: 32
+    tactile_crop_shape: null
     share_tactile_model: true
-    tactile_output_all_patches: false  # 改为false，每个触觉传感器每时间步输出1个token
+    tactile_output_all_patches: false
     
     #####输出token序列模式 #####
     output_token_sequence: true
     
-    transforms:
-      - type: RandomCrop
-        ratio: 0.85
-      - _target_: torchvision.transforms.RandomRotation
-        degrees: [-5.0, 5.0]
-        expand: false
-      - _target_: torchvision.transforms.ColorJitter
-        brightness: 0.4
-        contrast: 0.5
-        saturation: 0.5
-        hue: 0.08
+    # 🔥 关闭所有数据增强，确保模型能完美拟合单条数据
+    transforms: []
      
     use_group_norm: false
     share_rgb_model: false
@@ -122,15 +113,15 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 16      # 🔥 50条数据最优配置：50÷16=3.125，每epoch约3-4个batch
-  num_workers: 4      # 🔥 适度降低worker数，避免过度overhead
-  shuffle: True
+  batch_size: 1       # 🔥 单条数据：batch_size必须为1
+  num_workers: 0      # 🔥 单条数据：关闭多进程加载，避免overhead
+  shuffle: False      # 🔥 单条数据：关闭shuffle，确保训练稳定性
   pin_memory: True
-  persistent_workers: True
+  persistent_workers: False  # 🔥 num_workers=0时必须为False
 
 val_dataloader:
-  batch_size: 16
-  num_workers: 2
+  batch_size: 1
+  num_workers: 0
   shuffle: False
   pin_memory: True
   persistent_workers: False
@@ -146,46 +137,45 @@ val_dataloader:
 #   - 实验组（本配置）: weight_decay=1.0e-4，但Gate参数被自动保护
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 2.0e-4
+  lr: 5.0e-4  # 🔥 提高学习率加速过拟合（原2e-4 → 5e-4）
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  weight_decay: 1.0e-4  # 🔥 保持相同的weight_decay值，但Gate参数会被自动排除
+  weight_decay: 0.0  # 🔥 关闭weight_decay，单条数据不需要正则化
 
 training:
   device: "cuda:0"
   env_device: "cuda:0"
   seed: 42
   debug: False
-  resume: True
+  resume: False  # 🔥 单条数据测试：从头训练，不resume旧模型
   lr_scheduler: cosine
-  lr_warmup_steps: 100  # 🔥 降低warmup步数（batch_size=16时，100epoch≈310步）
-  num_epochs: 301
+  lr_warmup_steps: 50  # 🔥 大幅缩短warmup（原500→50），快速达到峰值学习率
+  num_epochs: 2000  # 🔥 单条数据：1 epoch = 1 step，所以2000 epoch = 2000步
   gradient_accumulate_every: 1
   use_wandb: true
   max_grad_norm: 5.0
-  use_ema: True  
-  rollout_every: 100
-  checkpoint_every: 50
-  val_every: 50
-  sample_every: 5
-  max_train_steps: null
+  use_ema: False  # 🔥 关闭EMA，单条数据不需要模型平滑
+  rollout_every: 100000  # 🔥 关闭rollout（设为超大值），节省时间
+  checkpoint_every: 50  # 🔥 每50个epoch保存一次checkpoint
+  val_every: 10  # 🔥 每10个epoch验证一次
+  sample_every: 10  # 🔥 每10个epoch采样一次
+  max_train_steps: null  # 🔥 改为null（单条数据时此参数无效）
   max_val_steps: null
   tqdm_interval_sec: 1.0
   
-  # 模态Drop配置（训练时数据增强，推理时自动关闭）
-  # 设计理念：模拟真实机器人操作中的传感器失效场景，提升模型鲁棒性
+  # 🔥 关闭所有模态Drop，确保输入完全一致
   modality_drop:
-    head_drop: 0.0         # 20%概率Drop头部相机（模拟被机械臂遮挡）
-    rgb_wrist_drop: 0.0   # 5%概率Drop腕部相机（近距离视角，不易遮挡）
-    tactile_drop: 0.0      # 保留触觉（接触信息是兜底保障）
-    proprio_drop: 0.0      # 20%概率Drop本体感知（强制学习视觉-触觉依赖）
+    head_drop: 0.0
+    rgb_wrist_drop: 0.0
+    tactile_drop: 0.0
+    proprio_drop: 0.0
 
 logging:
   group: ${exp_name}
   id: null
   mode: online
-  name: ${training.seed}_no_gate_decay
-  project: ManiFlow_Tactile_Image_GateAttn
+  name: ${training.seed}_overfit_1sample
+  project: ManiFlow_Tactile_Image_GateAttn_Test
   resume: false
   tags:
   - ${logging.project}
@@ -193,20 +183,20 @@ logging:
   - gate_attention
   - tactile_rgb
   - headwise_gate
-  - no_gate_decay  # 🔥 新增标签，用于对比实验
-  - gate_collapse_fix  # 🔥 标记为Gate Collapse修复实验
+  - overfit_test  # 🔥 标记为过拟合测试实验
+  - single_sample  # 🔥 单条数据实验标签
 
 checkpoint:
   save_ckpt: True
   topk:
-    monitor_key: val_loss
+    monitor_key: train_loss  # 🔥 改为监控train_loss（单条数据val_loss无意义）
     mode: min
-    k: 1
-    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+    k: 3  # 🔥 保留最优的3个checkpoint（观察收敛轨迹）
+    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.6f}.ckpt'  # 🔥 修正：使用epoch而非step
   
   save_last_ckpt: True
   save_last_snapshot: False
-  save_every: 50
+  save_every: 500  # 🔥 每500个epoch额外保存完整checkpoint（防止意外中断）
 
 multi_run:
   run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}

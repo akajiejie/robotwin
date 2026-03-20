@@ -219,14 +219,14 @@ class TimmMultimodalEncoder(ModuleAttrMixin):
             
             # 获取RGB图像尺寸并创建数据增强
             image_shape = key_shape_map[rgb_keys[0]][1:]  # (H, W)
-            if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
+            if transforms is not None and len(transforms) > 0 and not isinstance(transforms[0], torch.nn.Module):
                 if hasattr(transforms[0], 'type') and transforms[0].type == 'RandomCrop':
                     ratio = transforms[0].ratio
                     transforms = [
                         torchvision.transforms.RandomCrop(size=int(image_shape[0] * ratio)),
                         torchvision.transforms.Resize(size=image_shape[0], antialias=True)
                     ] + transforms[1:]
-            transform = nn.Identity() if transforms is None else nn.Sequential(*transforms)
+            transform = nn.Identity() if transforms is None or len(transforms) == 0 else nn.Sequential(*transforms)
             
             # 为每个RGB相机分配模型和变换
             for key in rgb_keys:

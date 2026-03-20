@@ -28,11 +28,12 @@ export TOKENIZERS_PARALLELISM=false
 export HYDRA_FULL_ERROR=1
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 
-export HF_HOME="/shared_disk/models/huggingface"
-export HF_HUB_CACHE="/shared_disk/models/huggingface"
-export TORCH_HOME="/shared_disk/models/huggingface"
-export TRANSFORMERS_CACHE="/shared_disk/models/huggingface"
-# 🔥 启用HuggingFace离线模式 (使用本地缓存的预训练权重)
+# 🔥 修正HuggingFace缓存路径为实际存在的目录
+export HF_HOME="${HOME}/.cache/huggingface"
+export HF_HUB_CACHE="${HOME}/.cache/huggingface/hub"
+export TORCH_HOME="${HOME}/.cache/torch"
+export TRANSFORMERS_CACHE="${HOME}/.cache/huggingface/transformers"
+# 🔥 启用HuggingFace离线模式 (使用本地缓存的SigLIP预训练权重)
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
